@@ -47,8 +47,9 @@ CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j"$(nproc)"
 #In another Terminal
 mkdir findings
 python3 make_seeds.py
-AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_AUTORESUME=1 AFL_DEBUG=1 AFL_SKIP_BIN_CHECK=1 AFL_DUMB_FORKSRV=1 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harness3.py @@
-
+#AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_AUTORESUME=1 AFL_DEBUG=1 AFL_SKIP_BIN_CHECK=1 AFL_DUMB_FORKSRV=1 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harness3.py @@
+#AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harness3.py @@
+AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
 #In another Terminal
 python3 px4_lifeline.py
 

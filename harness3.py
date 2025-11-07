@@ -23,6 +23,9 @@ import socket
 import select
 import threading
 import time
+import json
+import signal
+import subprocess
 import afl  # python-afl; must be available
 from pymavlink import mavutil
 
@@ -34,6 +37,15 @@ MAVLINK_HOST = os.getenv("MAVLINK_HOST", "127.0.0.1")
 MAVLINK_PORT = int(os.getenv("MAVLINK_PORT", "14540"))  # PX4 offboard port (PX4 remote -> our local addr)
 SINK_HOST = os.getenv("SINK_HOST", MAVLINK_HOST)
 SINK_PORT = int(os.getenv("SINK_PORT", MAVLINK_PORT))
+LOCKFILE  = os.getenv("PX4_LOCK", "/tmp/px4.restart.lock")
+
+
+SHELL_TARGET = os.getenv("PX4_SHELL_ENDPOINT", "udpout:127.0.0.1:14540")
+STARTER   = os.getenv("PX4_STARTER", "./startPX4.sh") 
+PID_FILE  = os.getenv("PID_FILE", "/tmp/px4_pids.json")
+
+POST_SEND_SLEEP = float(os.getenv("POST_SEND_SLEEP", "0.03"))  # small dwell
+
 
 HEARTBEAT_HZ = float(os.getenv("HEARTBEAT_HZ", "2"))
 TIMEOUT_CONNECT_MS = int(os.getenv("TIMEOUT_CONNECT_MS", "1500"))
@@ -63,11 +75,11 @@ def try_connect_mavlink():
         # wait briefly for heartbeat so PX4 sees our addr
         t0 = time.time()
         while time.time() - t0 < (TIMEOUT_CONNECT_MS / 1000.0):
-            hb = mav.recv_match(type='HEARTBEAT', blocking=True, timeout=0.25)
+            hb = mav.recv_match(type='HEARTBEAT', blocking=True, timeout=0.5)
             if hb:
                 return mav
         # no heartbeat seen — still return mav (it lets us send), but caller may choose None
-        return mav
+        return None
     except Exception:
         return None
 
@@ -145,19 +157,85 @@ def send_once(data: bytes):
             s.close()
         except Exception:
             pass
+# ----------------- pid helpers -----------------
 
+
+def restart_px4():
+    # Use flock to avoid parallel restarts when AFL respawns harness quickly
+    cmd = f"flock -n {LOCKFILE} bash -lc '{STARTER}'"
+    subprocess.run(cmd, shell=True, check=False)
+    time.sleep(10)
+
+def _read_px4_pid(path=PID_FILE):
+    with open(path, "r", encoding="utf-8") as f:
+        return int(json.load(f)["px4_pid"])
+
+
+def _read_px4_pids(path=PID_FILE):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return [int(p) for p in data.get("px4_pids", [])]
+
+def _alive_and_not_zombie(pid: int) -> bool:
+    """
+    Return True if process exists and is not in Zombie state.
+    Linux: /proc/<pid>/stat 3rd field is state char (R,S,D,T,Z,...)
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r") as st:
+            # format: pid (comm) state ...
+            # state is the third token, but (comm) may contain spaces.
+            txt = st.read()
+        # Extract tokens safely: pid (comm) state — split on ') ' then space
+        after_comm = txt.split(") ", 1)[1]
+        state = after_comm.split()[0]  # single letter
+        return state != "Z"
+    except FileNotFoundError:
+        # /proc/<pid> missing => dead
+        return False
+    except Exception:
+        # If anything odd happens, be conservative: assume alive
+        return True
+
+def reap_zombie_parent():
+    import subprocess
+    # Kill any gnome-terminal or bash parents running the old cmake-env command
+    subprocess.run(
+        "pkill -f 'gnome-terminal.*PX4_SIM_MODEL=gz_x500'",
+        shell=True, check=False)
+    subprocess.run(
+        "pkill -f '/usr/bin/cmake -E env PX4_SIM_MODEL=gz_x500'",
+        shell=True, check=False)
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)     # does not kill; checks existence
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 # ----------------- main harness -----------------
 def main():
     global _mav
+    
+    # Read the two tracked PIDs
+    try:
+        px4_pids = _read_px4_pids()
+    except Exception as e:
+        sys.stderr.write(f"[harness] PID file error: {e}\n")
+        px4_pids = []
+
+    before = [ _alive_and_not_zombie(p) for p in px4_pids ]
+
+
     # Try to connect to MAVLink quickly (non-blocking-ish). If it fails, proceed anyway.
     _mav = try_connect_mavlink()
 
-    # If we have a pymavlink connection, start heartbeat thread to prevent PX4 auto-disarm.
-    hb_thread = None
+    # If we have do not a pymavlink connection
     if _mav:
-        hb_thread = threading.Thread(target=hb_thread_fn, args=(_mav, _hb_stop), daemon=True)
-        hb_thread.start()
+        print("MAV Connected" )
     else:
         # no mavlink connection — we still proceed but we warn
         sys.stderr.write("[harness] Warning: could not connect to MAVLink; proceeding with raw UDP sends.\n")
@@ -203,6 +281,20 @@ def main():
                 hb_thread.join(timeout=0.5)
         except Exception:
             pass
+
+
+    time.sleep(POST_SEND_SLEEP)  # tiny dwell so a crash can manifest
+    #print("Cause Crash start\n")
+    #time.sleep(10)
+    #print("Cause Crash end\n")
+    after = [ _alive_and_not_zombie(p) for p in px4_pids ]
+
+    # If any went from alive->dead OR alive->zombie, signal crash to AFL
+    for b, a, p in zip(before, after, px4_pids):
+        if b and not a:
+            sys.stderr.write(f"[harness] PX4 PID {p} died or became zombie; signaling crash.\n")
+            restart_px4()
+            os.kill(os.getpid(), signal.SIGSEGV)
 
 
 if __name__ == "__main__":
