@@ -32,10 +32,22 @@ import afl  # python-afl - provides afl.loop()/afl.init()
 
 # --------------------- Configuration (env overrides) ---------------------
 MAVLINK_HOST = os.getenv("MAVLINK_HOST", "127.0.0.1")   # PX4 IP for UDP
-MAVLINK_PORT = int(os.getenv("MAVLINK_PORT", "14560")) # PX4 RX port (we send to this)
+MAVLINK_PORT = int(os.getenv("MAVLINK_PORT", "14540")) # PX4 RX port (we send to this)
 START_CMD = os.getenv("PX4_START_CMD", "./startPX4.sh")  # script/command to start PX4
+
+# Path fragment that uniquely identifies the *real* px4 binary (not the cmake wrapper)
+PX4_DIR = os.getenv("PX4_DIR", os.path.join(os.getcwd(), "PX4-Autopilot"))
+PX4_BIN_MATCH = os.getenv(
+    "PX4_BIN_MATCH",
+    os.path.join(PX4_DIR, "build/px4_sitl_default/bin/px4")
+)
+
 PX4_PID_GREP = os.getenv("PX4_PID_GREP",
     "/usr/bin/cmake -E env PX4_SIM_MODEL=gz_x500")  # grep pattern to find px4 wrapper PIDs
+PX4_PID_GREP_LIST = [
+    "/usr/bin/cmake -E env PX4_SIM_MODEL=gz_x500",
+    "/build/px4_sitl_default/bin/px4"
+]
 PID_FILE = os.getenv("PID_FILE", "/tmp/px4_pids.json")
 HEARTBEAT_MS = int(os.getenv("HEARTBEAT_MS", "500"))    # keepalive heartbeat interval (ms)
 SETPOINT_HZ = int(os.getenv("SETPOINT_HZ", "20"))      # setpoint stream rate
@@ -56,43 +68,90 @@ def log(msg):
         _log_fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
 
 # -------------------- PX4 start / PID management -------------------------
+def ensure_px4_running():
+    """
+    Check if PX4 processes (as listed in PID_FILE) are alive.
+    If none or any are missing/zombie, start PX4 via start_px4().
+    Otherwise, skip restart and log that PX4 is already running.
+    """
+    pids = read_px4_pids()
+    if not pids:
+        log("[ensure_px4_running] no pids found; starting PX4")
+        start_px4()
+        return
+
+    alive = [is_pid_alive_not_zombie(p) for p in pids]
+    if all(alive):
+        log(f"[ensure_px4_running] PX4 appears already running (pids={pids})")
+        return
+
+    log(f"[ensure_px4_running] some PX4 pids dead/zombie ({pids}); restarting")
+    start_px4()
+
 def start_px4():
     """
-    Start PX4 using START_CMD. We run the command via bash -lc so the START_CMD
-    can be a shell script or complex command. Uses flock to avoid concurrent starts.
-    After starting, pause briefly and snap PIDs to PID_FILE as JSON: {"px4_pids":[p1,p2]}
+    Launch PX4 SITL in a new GNOME Terminal (interactive output).
+    - Kills any existing px4 binary and Gazebo first (clean reset).
+    - Serialized by RESTART_LOCK to avoid multiple terminals.
+    - Snapshots only the real px4 PID(s).
+    - Waits ~15s for full boot/settle.
     """
-    lock = RESTART_LOCK
-    # Use flock to serialise restarts (shell 'flock -n FILE cmd')
-    cmd = f"flock -n {lock} -c '{START_CMD}'"
-    log(f"[start_px4] running: {cmd}")
-    # Run asynchronously; do not wait for it to exit (it should exec px4 or a supervisor)
-    subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # Give PX4 some time to appear, then snapshot pids
-    time.sleep(4.0)
+    px4_dir = PX4_DIR
+    num_procs = os.getenv("NUM_PROCS", str(os.cpu_count() or 4))
+    make_cmd = f"CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j{num_procs}"
+
+    # Clean slate
+    kill_existing_px4()
+    kill_gazebo()
+
+    term_under_flock = [
+        "bash", "-lc",
+        f"flock -n {RESTART_LOCK} -c "
+        f"'gnome-terminal --working-directory \"{px4_dir}\" -- "
+        f"bash -lc \"{make_cmd}; exec bash\"'"
+    ]
+
+    log(f"[start_px4] launching GNOME terminal in {px4_dir} with: {make_cmd}")
+    try:
+        subprocess.Popen(term_under_flock,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"[start_px4] error launching terminal: {e}")
+        raise
+
+    # Let processes appear, then record *only* real px4 PID(s)
+    time.sleep(5.0)
     snap_px4_pids()
+
+    log("[start_px4] waiting 15s to let PX4 and simulator fully settle")
+    time.sleep(25.0)
+    log("[start_px4] start complete")
 
 def snap_px4_pids():
     """
-    Find px4-related PIDs using ps+grep pattern (PX4_PID_GREP) and write JSON
-    to PID_FILE: {"px4_pids": [pid1, pid2, ...]}
+    Find PIDs of the actual px4 runtime binary only (not the cmake wrapper),
+    and write JSON: {"px4_pids": [pid1, ...]} to PID_FILE.
     """
     try:
-        # run ps aux and filter by pattern
-        out = subprocess.check_output(["bash", "-lc",
-            f"ps aux | grep '[{PX4_PID_GREP[0]}]{PX4_PID_GREP[1:]}' | awk '{{print $2}}' || true"],
-            stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2.0)
-        # Keep tokens that look like ints, unique, and convert
-        pids = []
-        for line in out.strip().splitlines():
-            try:
-                p = int(line.strip())
-                if p not in pids: pids.append(p)
-            except Exception:
-                continue
-        if not pids:
-            log("[snap_px4_pids] no px4 pids found")
-        # Write JSON array (may be one or more PIDs)
+        # Use the bracket-trick so grep doesn't match itself
+        pat = PX4_BIN_MATCH
+        if not pat:
+            log("[snap_px4_pids] PX4_BIN_MATCH empty")
+            pids = []
+        else:
+            out = subprocess.check_output(
+                ["bash", "-lc",
+                 f"ps aux | grep '[{pat[0]}]{pat[1:]}' | awk '{{print $2}}' || true"],
+                stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2.0)
+            pids = []
+            for line in out.strip().splitlines():
+                try:
+                    pid = int(line.strip())
+                    if pid not in pids:
+                        pids.append(pid)
+                except:
+                    pass
         with open(PID_FILE, "w", encoding="utf-8") as f:
             json.dump({"px4_pids": pids}, f)
         log(f"[snap_px4_pids] wrote {PID_FILE}: {pids}")
@@ -125,26 +184,85 @@ def is_pid_alive_not_zombie(pid):
     except Exception:
         # conservatively assume alive if weird
         return True
-
+def kill_existing_px4(timeout_s: float = 8.0):
+    """
+    Terminate any running real px4 binary (not wrappers). SIGTERM, wait, then SIGKILL.
+    """
+    try:
+        # Simpler: no complex escaping required
+        out = subprocess.check_output(
+            ["bash", "-lc", f"pgrep -f '{PX4_BIN_MATCH}' || true"],
+            stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2.0)
+        pids = [int(x) for x in out.strip().split() if x.isdigit()]
+        if not pids:
+            return
+        log(f"[kill_existing_px4] terminating px4 pids: {pids}")
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            alive = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+            if not alive:
+                break
+            time.sleep(0.2)
+        # Hard kill stragglers
+        for pid in pids:
+            try:
+                if Path(f"/proc/{pid}").exists():
+                    os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception as e:
+        log(f"[kill_existing_px4] error: {e}")
+def kill_gazebo(timeout_s: float = 10.0):
+    """
+    Kill any lingering Gazebo (gz sim) processes so the world resets cleanly.
+    """
+    try:
+        # Broad but safe matches for SITL runs
+        pats = [
+            r"^\s*gz sim\b",
+            r"/Tools/simulation/gz/worlds/"
+        ]
+        for pat in pats:
+            subprocess.run(f"pkill -f \"{pat}\"", shell=True, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Wait until no gz sim remains
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            rc = subprocess.run("pgrep -f '^\\s*gz sim\\b' >/dev/null",
+                                shell=True)
+            if rc.returncode != 0:
+                break
+            time.sleep(0.3)
+        # Extra sweep for gazebo/ignition transport helpers
+        subprocess.run("pkill -f 'ign transport|gazebo|gz-'", shell=True, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"[kill_gazebo] error: {e}")
 # -------------------- MAVLink persistent connection & lifeline -------------
 tx = None
 _tx_lock = threading.Lock()
 _last_hb = 0.0
 
-def connect_tx():
+def connect_tx(timeout=20):
     """Create a persistent udpout MAVLink TX connection and send an initial heartbeat."""
     global tx, _last_hb
     with _tx_lock:
         try:
             # use udpout so we actively send to PX4 and avoid binding conflicts
-            conn_str = f"udpout:{MAVLINK_HOST}:{MAVLINK_PORT}"
+            conn_str = f"udp:{MAVLINK_HOST}:{MAVLINK_PORT}"
             tx = mavutil.mavlink_connection(conn_str, source_system=250)
-            # send an initial heartbeat so PX4 learns our addr
-            tx.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                                  0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
-            _last_hb = time.time()
-            log("[connect_tx] connected and initial heartbeat sent")
-            return True
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                if tx.recv_match(type='HEARTBEAT', blocking=True, timeout=1):
+                    _last_hb = time.time()
+                    log("[connect_tx] connected and initial heartbeat sent")
+                    return True
+            raise TimeoutError("No HEARTBEAT from PX4")
         except Exception as e:
             log(f"[connect_tx] failed: {e}")
             tx = None
@@ -279,7 +397,6 @@ def handle_px4_failure_and_restart():
             pass
         start_px4()
         # reconnect MAVLink tx after a short wait
-        time.sleep(10.0)
         connect_tx()
     except Exception as e:
         log(f"[handle_px4_failure_and_restart] restart error: {e}")
@@ -294,13 +411,25 @@ def afl_main_loop():
     sp_t = threading.Thread(target=setpoint_thread, args=(sp_stop,), daemon=True)
     hb_t.start(); sp_t.start()
 
+    # Allow ~2 s of heartbeats & setpoints so PX4 sees a valid GCS
+    log("[afl_main_loop] letting heartbeats run 2s so PX4 detects GCS before offboard/arm")
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+        try:
+            if tx:
+                tx.recv_match(blocking=False)
+        except Exception:
+            pass
+        time.sleep(0.05)
+
     # Best-effort: set Offboard and arm once at start
     set_mode_offboard_once()
     arm_once(wait_s=6)
     wait_alt()
 
     # Initialize AFL forkserver (python-afl). After this, children will run the loop body.
-    afl.init()
+    #afl.init()
+   # safe_afl_init()
     log("[afl_main_loop] AFL forkserver started; entering loop")
 
     while afl.loop():
@@ -337,16 +466,8 @@ def afl_main_loop():
 
 # --------------------------- Entrypoint ----------------------------------
 def main():
-    # Optionally start PX4 now if user provided START_CMD
-    if START_CMD:
-        log(f"[main] starting PX4 using: {START_CMD}")
-        start_px4()
-        time.sleep(1.5)
-    else:
-        log("[main] START_CMD empty; assume PX4 already running")
-
-    # Ensure we have a pid snapshot before entering AFL
-    snap_px4_pids()
+    log("[main] checking PX4 state...")
+    ensure_px4_running()
 
     try:
         afl_main_loop()
