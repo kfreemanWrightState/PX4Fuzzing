@@ -24,6 +24,7 @@ import subprocess
 import signal
 import socket
 import select
+import pdb
 from pathlib import Path
 
 # third-party
@@ -59,6 +60,12 @@ POST_SEND_MS = int(os.getenv("POST_SEND_MS", "30"))    # dwell after send to let
 MAX_INPUT = int(os.getenv("MAX_INPUT", "8192"))       # max bytes read from AFL
 LOGFILE = os.getenv("HARNESS_LOG", "/tmp/combined_fuzz.log")
 RESTART_LOCK = os.getenv("PX4_RESTART_LOCK", "/tmp/px4_restart.lock")
+
+UNSUPPORTED_COMMAND_ID = int(os.getenv("UNSUPPORTED_COMMAND_ID", "5000"))
+
+AFL_ITERATIONS = 1000
+
+vehicle_ready = False
 # -------------------------------------------------------------------------
 
 # simple logging helper (nonblocking to not slow AFL)
@@ -125,7 +132,7 @@ def start_px4():
     snap_px4_pids()
 
     log("[start_px4] waiting 15s to let PX4 and simulator fully settle")
-    time.sleep(25.0)
+    time.sleep(15.0)
     log("[start_px4] start complete")
 
 def snap_px4_pids():
@@ -217,6 +224,7 @@ def kill_existing_px4(timeout_s: float = 8.0):
                 pass
     except Exception as e:
         log(f"[kill_existing_px4] error: {e}")
+
 def kill_gazebo(timeout_s: float = 10.0):
     """
     Kill any lingering Gazebo (gz sim) processes so the world resets cleanly.
@@ -243,6 +251,7 @@ def kill_gazebo(timeout_s: float = 10.0):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         log(f"[kill_gazebo] error: {e}")
+
 # -------------------- MAVLink persistent connection & lifeline -------------
 tx = None
 _tx_lock = threading.Lock()
@@ -329,6 +338,26 @@ def setpoint_thread(stop_evt):
         stop_evt.wait(1.0 / SETPOINT_HZ)
 
 # ----------------- Offboard switch/arm helpers (best-effort) ----------------
+
+def prepare_vehicle_offboard():
+    """Warmup + arm + OFFBOARD; set vehicle_ready True on success."""
+    global vehicle_ready
+    # 2s warm-up (HB + setpoints already running)
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+        with _tx_lock:
+            if tx: tx.recv_match(blocking=False)
+        time.sleep(0.05)
+
+    # (SITL-friendly) relax a few checks if you want:
+    # set_param_tx("COM_ARM_WO_GPS", 1.0)
+    # set_param_tx("COM_RCL_EXCEPT", 4.0)
+
+    armed = arm_once(wait_s=10)
+    set_mode_offboard_once()
+    vehicle_ready = armed  # mark ready if we at least armed (OFFBOARD may follow)
+    return vehicle_ready
+
 def set_mode_offboard_once():
     try:
         with _tx_lock:
@@ -384,24 +413,36 @@ def wait_alt(min_alt_m=CONFIRM_ALT_M, timeout_s=30):
 
 # ---------------------- Crash handling & restart ---------------------------
 def handle_px4_failure_and_restart():
-    """
-    Called when harness detects px4 PID died or became zombie.
-    Attempt to restart PX4 via start_px4(). The start function uses flock to avoid races.
-    """
-    log("[handle_px4_failure_and_restart] px4 failure detected; restarting")
+    global vehicle_ready
+    log("[restart] px4 failure detected; restarting")
     try:
-        # Try to kill any detected stale px4 parents matching pattern (risky but useful)
-        try:
-            subprocess.run(f"pkill -f '{PX4_PID_GREP}'", shell=True, check=False)
-        except Exception:
-            pass
+        kill_existing_px4()
+        kill_gazebo()
         start_px4()
-        # reconnect MAVLink tx after a short wait
-        connect_tx()
+        # Reconnect TX (retry a few times)
+        for _ in range(10):
+            if connect_tx():
+                break
+            time.sleep(1.0)
+        # Re-prepare vehicle once per restart
+        if connect_tx():
+            if prepare_vehicle_offboard():
+                log("[restart] vehicle re-armed and in OFFBOARD")
+            else:
+                log("[restart] vehicle prepare failed; will keep trying during fuzz")
+        arm_once(wait_s=6)
+        wait_alt()
+        vehicle_ready = True
     except Exception as e:
-        log(f"[handle_px4_failure_and_restart] restart error: {e}")
+        log(f"[restart] error: {e}")
+        vehicle_ready = False
 
 # ---------------------- AFL persistent harness loop -----------------------
+def safe_afl_init():
+    try: afl.init()
+    except RuntimeError as e:
+        if "AFL already initialized" not in str(e): raise
+
 def afl_main_loop():
     # Prepare TX connection and lifeline threads BEFORE afl.init() ideally so parent keeps connection:
     connect_tx()
@@ -429,10 +470,12 @@ def afl_main_loop():
 
     # Initialize AFL forkserver (python-afl). After this, children will run the loop body.
     #afl.init()
-   # safe_afl_init()
+    #safe_afl_init()
     log("[afl_main_loop] AFL forkserver started; entering loop")
 
+    #pdb.set_trace()
     while afl.loop():
+    #while True:
         # read single testcase from stdin (persistent mode)
         data = sys.stdin.buffer.read(MAX_INPUT)
         if not data:
@@ -441,13 +484,18 @@ def afl_main_loop():
         # snapshot pids and liveness before send
         pids = read_px4_pids()
         before = [is_pid_alive_not_zombie(p) for p in pids]
-
+        send_unsupported_command_via_mav()
+        #send_unsupported_command_raw_udp()
+        #print("start crash")
         # send payload (fast)
+
         ok = send_raw(data)
 
         # small dwell for crash to manifest
         time.sleep(POST_SEND_MS / 1000.0)
 
+        time.sleep(10)
+        #print("end crash")
         # re-check
         after = [is_pid_alive_not_zombie(p) for p in pids]
 
@@ -463,6 +511,46 @@ def afl_main_loop():
     # cleanup (shouldn't normally reach here while AFL runs)
     hb_stop.set(); sp_stop.set()
     sp_t.join(timeout=1.0); hb_t.join(timeout=1.0)
+
+# --------------------------- Send UDP Messages ---------------------------
+
+def send_unsupported_command_via_mav():
+    """
+    Send an unsupported COMMAND_LONG via pymavlink.
+    PX4 should reply with COMMAND_ACK: RESULT=UNSUPPORTED (and print a log).
+    """
+    try:
+        with _tx_lock:
+            if tx:
+                log("[send_unsupported_command_via_mav] sending unsupported command...")
+                tx.mav.command_long_send(
+                    tx.target_system or 0,
+                    tx.target_component or 0,
+                    UNSUPPORTED_COMMAND_ID,
+                    0, 0,0,0,0,0,0,0
+                )
+                _ = tx.recv_match(type='COMMAND_ACK', blocking=False, timeout=0.05)
+    except Exception:
+        pass
+
+
+def send_unsupported_command_raw_udp():
+    """
+    Fallback: craft a minimal (likely invalid) UDP payload to the PX4 port.
+    This is less structured but still causes PX4 to log an unsupported command
+    when it resolves to a mis-parse / unsupported command.
+    """
+    try:
+        log("[send_unsupported_command_via_mav] sending unsupported command...")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setblocking(False)
+        # send a tiny blob containing the command id as plain bytes (not proper MAVLink)
+        # PX4's UDP layer will get this and likely log a parse error — still an "error" event.
+        payload = b'CMD' + bytes(str(UNSUPPORTED_COMMAND_ID), 'ascii')
+        s.sendto(payload, (MAVLINK_HOST, MAVLINK_PORT))
+        s.close()
+    except Exception:
+        pass
 
 # --------------------------- Entrypoint ----------------------------------
 def main():
