@@ -484,7 +484,7 @@ def afl_main_loop():
         # snapshot pids and liveness before send
         pids = read_px4_pids()
         before = [is_pid_alive_not_zombie(p) for p in pids]
-        send_unsupported_command_via_mav()
+        #send_unsupported_command_via_mav()
         #send_unsupported_command_raw_udp()
         #print("start crash")
         # send payload (fast)
@@ -494,7 +494,7 @@ def afl_main_loop():
         # small dwell for crash to manifest
         time.sleep(POST_SEND_MS / 1000.0)
 
-        time.sleep(10)
+        #time.sleep(10)
         #print("end crash")
         # re-check
         after = [is_pid_alive_not_zombie(p) for p in pids]
