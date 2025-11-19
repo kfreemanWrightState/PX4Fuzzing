@@ -4,6 +4,44 @@ This README provides a complete guide for installing all required packages, buil
 
 ---
 
+## Requirements
+
+Your environment must meet the following requirements before building PX4 and running the fuzzing harness:
+
+### **Operating System**
+- **Ubuntu 24.04 LTS** (recommended and tested)
+- Other Linux distros *may* work but are not supported by this guide.
+
+### **System Resources**
+- At least **4 CPU cores** (8 recommended for faster AFL fuzzing)
+- At least **8 GB RAM** (16+ recommended)
+- At least **20 GB free disk space**
+  - PX4 + Gazebo + logs + AFL findings can grow quickly.
+
+### **Internet Access**
+Required for:
+- Installing system packages  
+- Downloading PX4, QGroundControl, Gazebo dependencies  
+- Fetching Python modules and AFL++ updates  
+
+### **Software Requirements**
+This project requires:
+- **Python 3.10+**
+- **pip** (Python package manager)
+- **clang** and **lld** (for ASan builds)
+- **AFL++** or **python-afl**
+- **Git**
+- **PX4-Autopilot** source code
+- **Gazebo Garden / Gazebo Classic** depending on the build configuration
+- **QGroundControl (optional)** for manual MAVLink verification
+
+### **Hardware Acceleration (Optional)**
+For improved Gazebo performance:
+- A GPU that supports **OpenGL 3.3+**
+- Proprietary NVIDIA/AMD drivers (optional but helpful)
+
+---
+
 ## 1. Install All Required Packages (One Command Block)
 
 Run this entire block at once:
@@ -34,7 +72,7 @@ pip3 install --upgrade python-afl --break-system-packages
 
 ## 2. Clone Required Repositories
 
-Clone your project:
+Clone this project:
 
 ```bash
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
@@ -145,3 +183,30 @@ pkill -f gz
 
 ---
 
+## References
+
+### **PX4 Documentation**
+- https://docs.px4.io/main/en/
+- https://docs.px4.io/main/en/simulation/
+- https://docs.px4.io/main/en/sim_gazebo_gz/
+- https://docs.px4.io/main/en/getting_started/px4_basic_concepts#ground-control-stations
+
+### **PX4 Fuzz Testing**
+- https://docs.px4.io/main/en/test_and_ci/fuzz_tests#running-fuzz-tests
+
+### **AFL++**
+- https://aflplus.plus/
+- https://github.com/AFLplusplus/AFLplusplus
+
+### **MAVLink Messaging**
+- https://docs.px4.io/main/en/mavlink/receiving_messages?utm_source=chatgpt.com
+- https://mavlink.io/en/messages/common.html?utm_source=chatgpt.com
+
+### **MAVLink Security Research**
+- https://arxiv.org/html/2501.18874v2?utm_source=chatgpt.com
+- https://cosicdatabase.esat.kuleuven.be/backend/publications/files/conferencepaper/2667?utm_source=chatgpt.com
+
+### **Drone Security Research (DJI / OcuSync / DroneID)**
+- https://www.ndss-symposium.org/wp-content/uploads/2023/02/ndss2023_f217_paper.pdf
+
+---
