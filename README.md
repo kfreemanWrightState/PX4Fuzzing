@@ -8,7 +8,7 @@ This README provides a complete guide for installing all required packages, buil
 
 Your environment must meet the following requirements before building PX4 and running the fuzzing harness:
 
-### **Operating System**
+### **Operating System (Host or VM)**
 - **Ubuntu 24.04 LTS** (recommended and tested)
 - Other Linux distros *may* work but are not supported by this guide.
 
@@ -42,9 +42,7 @@ For improved Gazebo performance:
 
 ---
 
-## 1. Install All Required Packages (One Command Block)
-
-Run this entire block at once:
+## 1. Install All Required Packages
 
 ```bash
 sudo apt update && sudo apt-get upgrade -y
@@ -136,10 +134,10 @@ Install PX4-required dependencies:
 ./Tools/setup/ubuntu.sh
 ```
 
-Build PX4 SITL with AddressSanitizer:
+Build PX4 SITL with AddressSanitizer (Does Not Start the simulator yet):
 
 ```bash
-CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl px4_sitl_default -j"$(nproc)"
+CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 ```
 
 This builds:
@@ -168,6 +166,18 @@ AFL++ will:
 - log crashes into `findings/`  
 
 ---
+![PX4 Fuzzing Diagram](./images/px4diagram.jpeg)
+
+
+**Figure: Overview of the PX4 MAVLink Fuzzing Workflow**
+
+This diagram illustrates how AFL++ interacts with the PX4 Software-In-The-Loop (SITL) process during fuzzing.  
+The parent harness process maintains the MAVLink connection, sends heartbeats, keeps the drone armed, and runs the AFL++ forkserver.  
+Each AFL++ child process receives fuzzed input through standard input, converts it into a MAVLink message, sends it to the PX4 SITL instance, and checks whether PX4 is still alive.
+
+If a crash is detected (or the PX4 PID becomes a zombie), the child triggers a SIGSEGV on itself so AFL++ records the crash and restarts the entire cycle.  
+If no crash occurs, the child exits normally and AFL++ continues mutating inputs.
+
 
 ## Notes and Tips
 
