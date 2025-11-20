@@ -166,7 +166,7 @@ AFL++ will:
 - log crashes into `findings/`  
 
 ---
-![PX4 Fuzzing Diagram](./images/px4diagram.jpeg)
+![PX4 Fuzzing Diagram](images/px4diagram.jpg)
 
 
 **Figure: Overview of the PX4 MAVLink Fuzzing Workflow**
