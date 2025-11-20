@@ -32,7 +32,7 @@ This project requires:
 - **AFL++** or **python-afl**
 - **Git**
 - **PX4-Autopilot** source code
-- **Gazebo Garden / Gazebo Classic** depending on the build configuration
+- **Gazebo Garden / Gazebo Classic**
 - **QGroundControl (optional)** for manual MAVLink verification
 
 ### **Hardware Acceleration (Optional)**
@@ -209,8 +209,9 @@ pkill -f gz
 - https://github.com/AFLplusplus/AFLplusplus
 
 ### **MAVLink Messaging**
-- https://docs.px4.io/main/en/mavlink/receiving_messages?utm_source=chatgpt.com
-- https://mavlink.io/en/messages/common.html?utm_source=chatgpt.com
+- https://www.youtube.com/watch?v=iZ-usX1VXRI
+- https://www.youtube.com/watch?v=Ha66uKC-od0
+- https://mavlink.io/en/about/overview.html
 
 ### **MAVLink Security Research**
 - https://arxiv.org/html/2501.18874v2?utm_source=chatgpt.com

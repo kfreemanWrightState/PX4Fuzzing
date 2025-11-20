@@ -30,6 +30,10 @@ cd PX4-Autopilot/
 
 ./Tools/setup/ubuntu.sh
 
+
+#unlimited size core dumps 
+ulimit -c unlimited 
+
 #***************************
 # running procedure, each on separate terminals
 #with ASAN 
@@ -43,6 +47,8 @@ make clean
 CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j"$(nproc)"
 
 #run "simulator_sih start" in the console to get an error and a crash and see the sanitizer messages
+
+
 
 #In another Terminal
 mkdir findings
