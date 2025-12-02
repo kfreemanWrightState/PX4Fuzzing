@@ -14,6 +14,50 @@ Notes:
  - For reliability, make your START_CMD spawn px4 directly (avoid gnome-terminal parent).
  - Environment overrides (defaults below) are clearly documented.
  - Requires: python-afl, pymavlink (pip install python-afl pymavlink)
+
+
+PX4 OFFBOARD / ARMING STATE MACHINE (simplified)
+
+States (from harness perspective):
+
+    S0: DISCONNECTED
+        - No PX4 heartbeat seen yet.
+        - Harness waits for heartbeats on MAVLink UDP.
+
+    S1: CONNECTED
+        - PX4 heartbeat received (vehicle system_id known).
+        - Harness sends GCS heartbeat back.
+
+    S2: ARMED
+        - Harness has sent MAV_CMD_COMPONENT_ARM_DISARM (param1=1).
+        - PX4 has accepted and is reporting ARMED in base_mode / nav_state.
+
+    S3: OFFBOARD
+        - Harness is sending OFFBOARD setpoints (e.g. SET_POSITION_TARGET_LOCAL_NED at ≥2 Hz).
+        - Harness has requested OFFBOARD mode (SET_MODE / DO_SET_MODE).
+        - PX4 reports OFFBOARD nav_state and stays in it as long as valid setpoints arrive.
+
+    S4: OFFBOARD_FUZZ
+        - Same as S3 (armed + offboard), but now harness:
+            * Reads fuzz data from AFL (stdin)
+            * Decodes that into structured MAVLink commands/setpoints
+            * Sends those to PX4 while monitoring for crashes / sanitizer reports
+
+Env var PX4_FUZZ_STAGE controls how far the harness drives PX4 before using fuzz input:
+
+    PX4_FUZZ_STAGE = "CONNECT"   -> stop after S1, fuzz early messages
+    PX4_FUZZ_STAGE = "ARM"       -> drive to S2, then fuzz
+    PX4_FUZZ_STAGE = "OFFBOARD"  -> drive to S3, then fuzz (recommended)
+    PX4_FUZZ_STAGE = "FULL"      -> same as OFFBOARD, but you can extend to cover more transitions
+
+NOTE:
+    This harness runs inside the AFL++ child process. In persistent mode, the same
+    child process executes the state machine multiple times, each time with new
+    fuzz input from AFL on stdin.
+
+
+
+
 """
 import os
 import sys
