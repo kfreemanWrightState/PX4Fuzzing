@@ -14,50 +14,6 @@ Notes:
  - For reliability, make your START_CMD spawn px4 directly (avoid gnome-terminal parent).
  - Environment overrides (defaults below) are clearly documented.
  - Requires: python-afl, pymavlink (pip install python-afl pymavlink)
-
-
-PX4 OFFBOARD / ARMING STATE MACHINE (simplified)
-
-States (from harness perspective):
-
-    S0: DISCONNECTED
-        - No PX4 heartbeat seen yet.
-        - Harness waits for heartbeats on MAVLink UDP.
-
-    S1: CONNECTED
-        - PX4 heartbeat received (vehicle system_id known).
-        - Harness sends GCS heartbeat back.
-
-    S2: ARMED
-        - Harness has sent MAV_CMD_COMPONENT_ARM_DISARM (param1=1).
-        - PX4 has accepted and is reporting ARMED in base_mode / nav_state.
-
-    S3: OFFBOARD
-        - Harness is sending OFFBOARD setpoints (e.g. SET_POSITION_TARGET_LOCAL_NED at ≥2 Hz).
-        - Harness has requested OFFBOARD mode (SET_MODE / DO_SET_MODE).
-        - PX4 reports OFFBOARD nav_state and stays in it as long as valid setpoints arrive.
-
-    S4: OFFBOARD_FUZZ
-        - Same as S3 (armed + offboard), but now harness:
-            * Reads fuzz data from AFL (stdin)
-            * Decodes that into structured MAVLink commands/setpoints
-            * Sends those to PX4 while monitoring for crashes / sanitizer reports
-
-Env var PX4_FUZZ_STAGE controls how far the harness drives PX4 before using fuzz input:
-
-    PX4_FUZZ_STAGE = "CONNECT"   -> stop after S1, fuzz early messages
-    PX4_FUZZ_STAGE = "ARM"       -> drive to S2, then fuzz
-    PX4_FUZZ_STAGE = "OFFBOARD"  -> drive to S3, then fuzz (recommended)
-    PX4_FUZZ_STAGE = "FULL"      -> same as OFFBOARD, but you can extend to cover more transitions
-
-NOTE:
-    This harness runs inside the AFL++ child process. In persistent mode, the same
-    child process executes the state machine multiple times, each time with new
-    fuzz input from AFL on stdin.
-
-
-
-
 """
 import os
 import sys
@@ -69,10 +25,12 @@ import signal
 import socket
 import select
 import pdb
+import struct
 from pathlib import Path
 
 # third-party
 from pymavlink import mavutil
+from pymavlink.dialects.v20 import common as mavlink2  # for explicit enums
 import afl  # python-afl - provides afl.loop()/afl.init()
 
 # --------------------- Configuration (env overrides) ---------------------
@@ -102,8 +60,14 @@ TARGET_Z = float(os.getenv("TARGET_Z", "-5.0"))        # LOCAL_NED negative = up
 CONFIRM_ALT_M = float(os.getenv("CONFIRM_ALT_M", "2.0"))
 POST_SEND_MS = int(os.getenv("POST_SEND_MS", "30"))    # dwell after send to let crash manifest
 MAX_INPUT = int(os.getenv("MAX_INPUT", "8192"))       # max bytes read from AFL
-LOGFILE = os.getenv("HARNESS_LOG", "/tmp/combined_fuzz.log")
-RESTART_LOCK = os.getenv("PX4_RESTART_LOCK", "/tmp/px4_restart.lock")
+LOGFILE          = os.getenv("HARNESS_LOG", "/tmp/combined_fuzz.log")
+RESTART_LOCK     = os.getenv("PX4_RESTART_LOCK", "/tmp/px4_restart.lock")
+
+GCS_SYSTEM_ID    = int(os.getenv("GCS_SYSTEM_ID", "250"))
+GCS_COMPONENT_ID = int(os.getenv(
+    "GCS_COMPONENT_ID",
+    str(mavutil.mavlink.MAV_COMP_ID_MISSIONPLANNER)
+))
 
 UNSUPPORTED_COMMAND_ID = int(os.getenv("UNSUPPORTED_COMMAND_ID", "5000"))
 
@@ -523,17 +487,156 @@ def afl_main_loop():
         # read single testcase from stdin (persistent mode)
         data = sys.stdin.buffer.read(MAX_INPUT)
         if not data:
-            data = b'\xfe'
+            # Minimal non-empty blob so we always send *something*
+            data = b"\x00"
 
-        # snapshot pids and liveness before send
-        pids = read_px4_pids()
-        before = [is_pid_alive_not_zombie(p) for p in pids]
         #send_unsupported_command_via_mav()
         #send_unsupported_command_raw_udp()
         #print("start crash")
         # send payload (fast)
 
-        ok = send_raw(data)
+        # ------------- Decide which message to fuzz -------------
+        selector = data[0]
+        msg_type = selector % 3  # 0=HEARTBEAT, 1=MISSION_ITEM_INT, 2=COMMAND_LONG
+
+        # Snapshot pids and liveness before send
+        pids = read_px4_pids()
+        before = [is_pid_alive_not_zombie(p) for p in pids]
+
+        # ------------- Build & send message based on msg_type -------------
+        if msg_type == 0:
+            # -------- HEARTBEAT fuzzing --------
+            # Keep type/autopilot stable to look like a real vehicle or GCS.
+            type_ = mavutil.mavlink.MAV_TYPE_QUADROTOR
+            autopilot = mavutil.mavlink.MAV_AUTOPILOT_PX4
+
+            base_mode = _get_u8(data, 1, 0)
+            custom_mode = _get_u32(data, 2, 0)
+            system_status = _get_u8(data, 6, mavutil.mavlink.MAV_STATE_ACTIVE)
+
+            send_fuzzed_heartbeat(
+                type_=type_,
+                autopilot=autopilot,
+                base_mode=base_mode,
+                custom_mode=custom_mode,
+                system_status=system_status,
+                mavlink_version=3,
+            )
+        elif msg_type == 1:
+            # -------- Single random waypoint (MISSION_ITEM_INT) --------
+            target_system = 1
+            target_component = 1
+
+            # Sequence always 0 (single waypoint, not a mission list)
+            seq = 0
+
+            # Constrain frame to common valid frames
+            frames = [
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_INT,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            ]
+            frame = frames[_get_u8(data, 3, 0) % len(frames)]
+
+            # Use NAV_WAYPOINT only (simpler and most widely handled)
+            command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+
+            current = 1        # this waypoint is immediately active
+            autocontinue = 0   # no mission continuation
+
+            # Waypoint parameters (bounded floating-point fuzzing)
+            param1 = _get_f32_scaled(data, 7, default=0.0, min_val=0.0, max_val=60.0)    # hold time
+            param2 = _get_f32_scaled(data, 11, default=5.0, min_val=0.0, max_val=100.0)  # acceptance radius
+            param3 = 0.0  # pass radius unused
+            param4 = _get_f32_scaled(data, 15, default=float("nan"), min_val=-180.0, max_val=180.0)  # yaw
+
+            # Coordinates:
+            # - If GLOBAL_* frame: lat/lon in degE7
+            # - If LOCAL_NED: used as meters by PX4
+            if frame in (
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_INT,
+            ):
+                lat_e7 = int(
+                    _get_f32_scaled(
+                        data, 19,
+                        default=39.7400,      # Ohio-ish default
+                        min_val=-85.0,
+                        max_val=85.0
+                    ) * 1e7
+                )
+                lon_e7 = int(
+                    _get_f32_scaled(
+                        data, 23,
+                        default=-84.1800,
+                        min_val=-180.0,
+                        max_val=180.0
+                    ) * 1e7
+                )
+                x = lat_e7
+                y = lon_e7
+            else:
+                # LOCAL_NED frame → meters
+                x = int(_get_f32_scaled(data, 19, default=0.0, min_val=-500.0, max_val=500.0))
+                y = int(_get_f32_scaled(data, 23, default=0.0, min_val=-500.0, max_val=500.0))
+
+            # Altitude / Z coordinate
+            z = _get_f32_scaled(data, 27, default=10.0, min_val=-50.0, max_val=200.0)
+
+            send_fuzzed_mission_item_int(
+                target_system=target_system,
+                target_component=target_component,
+                seq=seq,
+                frame=frame,
+                command=command,
+                current=current,
+                autocontinue=autocontinue,
+                param1=param1,
+                param2=param2,
+                param3=param3,
+                param4=param4,
+                x=x,
+                y=y,
+                z=z,
+            )
+        else:
+            # -------- COMMAND_LONG fuzzing --------
+            target_system = 1
+            target_component = 1
+
+            # Limit command to a small list of commonly used commands.
+            cmd_list = [
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                mavutil.mavlink.MAV_CMD_NAV_LAND,
+                mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            ]
+            command = cmd_list[_get_u8(data, 1, 0) % len(cmd_list)]
+            confirmation = _get_u8(data, 2, 0)
+
+            # Params: map bytes into bounded floats.
+            p1 = _get_f32_scaled(data, 3, 0.0, -10.0, 10.0)
+            p2 = _get_f32_scaled(data, 7, 0.0, -100.0, 100.0)
+            p3 = _get_f32_scaled(data, 11, 0.0, -100.0, 100.0)
+            p4 = _get_f32_scaled(data, 15, 0.0, -180.0, 180.0)
+            p5 = _get_f32_scaled(data, 19, 0.0, -1e6, 1e6)
+            p6 = _get_f32_scaled(data, 23, 0.0, -1e6, 1e6)
+            p7 = _get_f32_scaled(data, 27, 0.0, -1e6, 1e6)
+
+            send_fuzzed_command_long(
+                target_system=target_system,
+                target_component=target_component,
+                command=command,
+                confirmation=confirmation,
+                param1=p1,
+                param2=p2,
+                param3=p3,
+                param4=p4,
+                param5=p5,
+                param6=p6,
+                param7=p7,
+            )
 
         # small dwell for crash to manifest
         time.sleep(POST_SEND_MS / 1000.0)
@@ -595,6 +698,229 @@ def send_unsupported_command_raw_udp():
         s.close()
     except Exception:
         pass
+
+# ---------------- MAVLink v2 fuzzable helpers -----------------
+
+def _get_u8(data: bytes, idx: int, default: int = 0) -> int:
+    """Safe read of one byte as unsigned int."""
+    return data[idx] if idx < len(data) else default
+
+def _get_u16(data: bytes, idx: int, default: int = 0) -> int:
+    """Safe read of 2-byte little-endian unsigned int."""
+    if idx + 2 > len(data):
+        return default
+    return int.from_bytes(data[idx:idx+2], "little", signed=False)
+
+def _get_u32(data: bytes, idx: int, default: int = 0) -> int:
+    """Safe read of 4-byte little-endian unsigned int."""
+    if idx + 4 > len(data):
+        return default
+    return int.from_bytes(data[idx:idx+4], "little", signed=False)
+
+def _get_f32_scaled(
+    data: bytes,
+    idx: int,
+    default: float = 0.0,
+    min_val: float = -1000.0,
+    max_val: float = 1000.0,
+) -> float:
+    """
+    Map 4 bytes into a float in [min_val, max_val].
+    If not enough bytes, return default.
+    """
+    if idx + 4 > len(data):
+        return default
+    raw = int.from_bytes(data[idx:idx+4], "little", signed=False)
+    ratio = raw / 0xFFFFFFFF
+    return min_val + ratio * (max_val - min_val)
+
+def send_fuzzed_heartbeat(
+    type_: int,
+    autopilot: int,
+    base_mode: int,
+    custom_mode: int,
+    system_status: int,
+    mavlink_version: int = 3,
+):
+    """
+    Send a MAVLink2 HEARTBEAT with fuzzable fields.
+
+    Parameters correspond to MAVLink HEARTBEAT payload:
+      type_           : MAV_TYPE_*      (uint8)
+      autopilot       : MAV_AUTOPILOT_* (uint8)
+      base_mode       : MAV_MODE_FLAG_* bitmask (uint8)
+      custom_mode     : custom mode (uint32)
+      system_status   : MAV_STATE_*     (uint8)
+      mavlink_version : 2/3 (PX4 expects 3 for MAVLink2)
+
+    Example: 
+        send_fuzzed_heartbeat(
+        type_=mavlink2.MAV_TYPE_QUADROTOR,
+        autopilot=mavlink2.MAV_AUTOPILOT_PX4,
+        base_mode=mavlink2.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        custom_mode=0,
+        system_status=mavlink2.MAV_STATE_ACTIVE,
+        )
+    """
+    try:
+        with _tx_lock:
+            if tx is None:
+                if not connect_tx():
+                    return False
+
+            # pymavlink uses the connection's source_system/component internally,
+            # so these fields are only payload, not header IDs.
+            tx.mav.heartbeat_send(
+                type_,
+                autopilot,
+                base_mode,
+                custom_mode,
+                system_status,
+                mavlink_version,
+            )
+        return True
+    except Exception as e:
+        log(f"[send_fuzzed_heartbeat] error: {e}")
+        return False
+
+def send_fuzzed_mission_item_int(
+    target_system: int,
+    target_component: int,
+    seq: int,
+    frame: int,
+    command: int,
+    current: int,
+    autocontinue: int,
+    param1: float,
+    param2: float,
+    param3: float,
+    param4: float,
+    x: int,
+    y: int,
+    z: float,
+):
+    """
+    Send a MAVLink2 MISSION_ITEM_INT (waypoint-style) with fuzzable fields.
+
+    Fields:
+      target_system, target_component : who should execute this
+      seq           : waypoint index
+      frame         : MAV_FRAME_* (e.g., MAV_FRAME_GLOBAL_RELATIVE_ALT_INT)
+      command       : MAV_CMD_* (e.g., MAV_CMD_NAV_WAYPOINT)
+      current       : 1 if this is current item, else 0
+      autocontinue  : 1 for continuous mission
+      param1..4     : command-specific floats
+      x, y          : int32 lat/lon (degE7) or local coords depending on frame
+      z             : altitude or depth (float)
+
+      Example :
+        send_fuzzed_mission_item_int(
+            target_system=1,
+            target_component=1,
+            seq=0,
+            frame=mavlink2.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            command=mavlink2.MAV_CMD_NAV_WAYPOINT,
+            current=1,
+            autocontinue=1,
+            param1=0.0,    # hold time
+            param2=0.0,    # acceptance radius
+            param3=0.0,    # pass radius
+            param4=float('nan'),   # yaw
+            x=int(39.7392 * 1e7),  # lat_deg * 1e7
+            y=int(-104.9903 * 1e7),# lon_deg * 1e7
+            z=10.0,        # altitude (m)
+        )
+
+    """
+    try:
+        with _tx_lock:
+            if tx is None:
+                if not connect_tx():
+                    return False
+
+            tx.mav.mission_item_int_send(
+                target_system,
+                target_component,
+                seq,
+                frame,
+                command,
+                current,
+                autocontinue,
+                param1,
+                param2,
+                param3,
+                param4,
+                x,
+                y,
+                z,
+            )
+        return True
+    except Exception as e:
+        log(f"[send_fuzzed_mission_item_int] error: {e}")
+        return False
+
+def send_fuzzed_command_long(
+    target_system: int,
+    target_component: int,
+    command: int,
+    confirmation: int,
+    param1: float,
+    param2: float,
+    param3: float,
+    param4: float,
+    param5: float,
+    param6: float,
+    param7: float,
+):
+    """
+    Send a MAVLink2 COMMAND_LONG with fuzzable fields.
+
+    Fields:
+      target_system, target_component : recipient
+      command       : MAV_CMD_* (uint16)
+      confirmation  : confirmation count (uint8)
+      param1..7     : command-specific floats
+
+    Example : 
+        send_fuzzed_command_long(
+            target_system=1,
+            target_component=1,
+            command=mavlink2.MAV_CMD_COMPONENT_ARM_DISARM,
+            confirmation=0,
+            param1=1.0,   # 1 = arm, 0 = disarm
+            param2=0.0,
+            param3=0.0,
+            param4=0.0,
+            param5=0.0,
+            param6=0.0,
+            param7=0.0,
+        )
+
+    """
+    try:
+        with _tx_lock:
+            if tx is None:
+                if not connect_tx():
+                    return False
+
+            tx.mav.command_long_send(
+                target_system,
+                target_component,
+                command,
+                confirmation,
+                param1,
+                param2,
+                param3,
+                param4,
+                param5,
+                param6,
+                param7,
+            )
+        return True
+    except Exception as e:
+        log(f"[send_fuzzed_command_long] error: {e}")
+        return False
+
 
 # --------------------------- Entrypoint ----------------------------------
 def main():
