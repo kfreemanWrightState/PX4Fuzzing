@@ -128,6 +128,11 @@ Enter PX4:
 cd PX4-Autopilot/
 ```
 
+Fix a compile flag error in the PX4 Code
+```bash
+grep -R "O0-fprofile-arcs" -n .
+```
+
 Install PX4-required dependencies:
 
 ```bash
@@ -137,7 +142,7 @@ Install PX4-required dependencies:
 Build PX4 SITL with AddressSanitizer (Does Not Start the simulator yet):
 
 ```bash
-CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
+PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 ```
 
 This builds:

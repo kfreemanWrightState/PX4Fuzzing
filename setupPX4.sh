@@ -44,7 +44,11 @@ make clean
 #export ASAN_OPTIONS="verbosity=1:detect_leaks=1:abort_on_error=1"
 #export ASAN_OPTIONS="abort_on_error=1"
 #export ASAN_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-18 || command -v llvm-symbolizer || echo /usr/bin/llvm-symbolizer)"
+#CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j"$(nproc)"
+
 CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j"$(nproc)"
+
+PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j"$(nproc)"
 
 #run "simulator_sih start" in the console to get an error and a crash and see the sanitizer messages
 
