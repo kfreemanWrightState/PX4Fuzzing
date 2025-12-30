@@ -57,7 +57,7 @@ sudo apt install -y \
   libc++-dev libc++abi-dev \
   python3 python3-pip git \
   valgrind afl++ \
-  wget unzip tar
+  wget unzip tar llcov
 ```
 
 Install python-afl:
@@ -130,7 +130,7 @@ cd PX4-Autopilot/
 
 Fix a compile flag error in the PX4 Code
 ```bash
-grep -R "O0-fprofile-arcs" -n .
+grep -Rl 'O0-fprofile-arcs' . --exclude-dir=build | xargs sed -i 's/O0-fprofile-arcs/O0 -fprofile-arcs/g'
 ```
 
 Install PX4-required dependencies:
@@ -142,7 +142,16 @@ Install PX4-required dependencies:
 Build PX4 SITL with AddressSanitizer (Does Not Start the simulator yet):
 
 ```bash
-PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
+
+PX4_CMAKE_BUILD_TYPE=Coverage \
+CC=clang CXX=clang++ \
+CMAKE_ARGS="\
+-DCMAKE_C_FLAGS='-fsanitize=address' \
+-DCMAKE_CXX_FLAGS='-fsanitize=address' \
+-DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
+make px4_sitl -j"$(nproc)"
+
+#PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 ```
 
 This builds:
@@ -158,6 +167,8 @@ This builds:
 Run the harness in a second terminal:
 
 ```bash
+cd .. 
+
 AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
 ```

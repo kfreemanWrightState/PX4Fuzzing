@@ -27,11 +27,14 @@ import select
 import pdb
 import struct
 from pathlib import Path
+import textwrap
 
 # third-party
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import common as mavlink2  # for explicit enums
 import afl  # python-afl - provides afl.loop()/afl.init()
+
+from cov_reporter import start_coverage_thread_from_ini
 
 # --------------------- Configuration (env overrides) ---------------------
 MAVLINK_HOST = os.getenv("MAVLINK_HOST", "127.0.0.1")   # PX4 IP for UDP
@@ -103,7 +106,74 @@ def ensure_px4_running():
     log(f"[ensure_px4_running] some PX4 pids dead/zombie ({pids}); restarting")
     start_px4()
 
+
 def start_px4():
+    px4_dir = PX4_DIR
+    num_procs = os.getenv("NUM_PROCS", str(os.cpu_count() or 4))
+
+    make_cmd = (
+        f'PX4_CMAKE_BUILD_TYPE=Coverage '
+        f'CC=clang CXX=clang++ '
+        f'CMAKE_ARGS="-DCMAKE_C_FLAGS=-fsanitize=address '
+        f'-DCMAKE_CXX_FLAGS=-fsanitize=address '
+        f'-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address" '
+        f'make px4_sitl gz_x500 -j{num_procs}'
+    )
+
+    print(make_cmd)
+
+    kill_existing_px4()
+    kill_gazebo()
+
+    # Acquire lock in python (simpler than flock -c nested quoting)
+    lock_fd = os.open(RESTART_LOCK, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        import fcntl
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("[start_px4] restart lock held; skipping start")
+        os.close(lock_fd)
+        return
+    except Exception as e:
+        log(f"[start_px4] flock error: {e}")
+        os.close(lock_fd)
+        raise
+
+    try:
+        # Send gnome-terminal stderr/stdout to a real log file so you can see failures
+        term_log = open("/tmp/px4_gnome_terminal.log", "ab", buffering=0)
+
+        # ONE bash -lc layer only; no extra quoting games
+        bash_line = f'cd "{px4_dir}" && {make_cmd}; exec bash'
+
+        cmd = [
+            "gnome-terminal",
+            "--working-directory", px4_dir,
+            "--",
+            "bash", "-lc", bash_line,
+        ]
+
+        log(f"[start_px4] launching: {cmd}")
+        subprocess.Popen(cmd, stdout=term_log, stderr=term_log)
+
+    finally:
+        # release lock
+        try:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(lock_fd)
+
+    time.sleep(5.0)
+    snap_px4_pids()
+    log("[start_px4] waiting 15s to let PX4 and simulator fully settle")
+    time.sleep(15.0)
+    log("[start_px4] start complete")
+
+
+
+def start_px42():
     """
     Launch PX4 SITL in a new GNOME Terminal (interactive output).
     - Kills any existing px4 binary and Gazebo first (clean reset).
@@ -113,8 +183,21 @@ def start_px4():
     """
     px4_dir = PX4_DIR
     num_procs = os.getenv("NUM_PROCS", str(os.cpu_count() or 4))
-    make_cmd = f"CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j{num_procs}"
 
+
+    make_cmd = (
+        f'PX4_CMAKE_BUILD_TYPE=Coverage '
+        f'CC=clang CXX=clang++ '
+        f'CMAKE_ARGS="-DCMAKE_C_FLAGS=-fsanitize=address '
+        f'-DCMAKE_CXX_FLAGS=-fsanitize=address '
+        f'-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address" '
+        f'make px4_sitl gz_x500 -j{num_procs}'
+    )
+    #make_cmd = f'PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ CMAKE_ARGS="-DCMAKE_C_FLAGS=-fsanitize=address -DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address" make px4_sitl gz_x500 -j{num_procs}'
+    
+    #make_cmd1 = f"CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j{num_procs}"
+    print(make_cmd)
+    #print(make_cmd1)
     # Clean slate
     kill_existing_px4()
     kill_gazebo()
@@ -199,6 +282,7 @@ def is_pid_alive_not_zombie(pid):
     except Exception:
         # conservatively assume alive if weird
         return True
+
 def kill_existing_px4(timeout_s: float = 8.0):
     """
     Terminate any running real px4 binary (not wrappers). SIGTERM, wait, then SIGKILL.
@@ -454,6 +538,11 @@ def safe_afl_init():
 def afl_main_loop():
     # Prepare TX connection and lifeline threads BEFORE afl.init() ideally so parent keeps connection:
     connect_tx()
+
+    cov_t = start_coverage_thread_from_ini(
+        ini_path="coverage.ini",
+        findings_dir=None,     # use fallback_findings_dir
+    )
     hb_stop = threading.Event()
     sp_stop = threading.Event()
     hb_t = threading.Thread(target=gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
@@ -656,8 +745,12 @@ def afl_main_loop():
                 os.kill(os.getpid(), signal.SIGSEGV)
 
     # cleanup (shouldn't normally reach here while AFL runs)
-    hb_stop.set(); sp_stop.set()
-    sp_t.join(timeout=1.0); hb_t.join(timeout=1.0)
+    cov_t.stop()
+    cov_t.join(timeout=5)
+    hb_stop.set();
+    sp_stop.set()
+    sp_t.join(timeout=1.0);
+    hb_t.join(timeout=1.0)
 
 # --------------------------- Send UDP Messages ---------------------------
 
