@@ -166,19 +166,18 @@ This builds:
 
 
 ```bash
-
-# Make sure all the cores of the processor are set to performace mode. These canse be set back to 
+# If you running the PX4 project on a virtual machine skip this command, however if you are running Ubuntu 
+# on a bare metal computer run the following command.  
+# This command makes sure all the cores of the processor are set to performace mode. These canse be set back to 
 # normal using the ubuntu performace settings
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
 ```
 
-Run the harness in a second terminal:
+Run the Python harness with AFL++ :
 
 ```bash
 cd .. 
-
-#Make sure the processor is set to performace mode 
 
 AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
