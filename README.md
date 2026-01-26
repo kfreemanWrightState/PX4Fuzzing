@@ -171,7 +171,7 @@ cd ..
 # Make sure all the cores of the processor are set to performace mode. These canse be set back to 
 # normal using the ubuntu performace settings
 cd /sys/devices/system/cpu
-sudo echo performace | tee cpu*/cpufreq/scaling_governor
+echo performace | sudo tee cpu*/cpufreq/scaling_governor
 
 cd - 
 ```
