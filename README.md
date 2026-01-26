@@ -73,9 +73,6 @@ sudo pip3 install --upgrade python-afl --break-system-packages
 Clone this project:
 
 ```bash
-mkdir -p px4 
-cd px4 
-
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
 cd PX4Fuzzing
 ```
@@ -92,7 +89,7 @@ Clone QGroundControl source (optional):
 git clone https://github.com/mavlink/qgroundcontrol.git
 ```
 
-Download the prebuilt QGroundControl AppImage:
+Download the prebuilt QGroundControl AppImage (optional):
 
 ```bash
 wget https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage
