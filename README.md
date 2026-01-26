@@ -63,7 +63,7 @@ sudo apt install -y \
 Install python-afl:
 
 ```bash
-pip3 install --upgrade python-afl --break-system-packages
+sudo pip3 install --upgrade python-afl --break-system-packages
 ```
 
 ---
