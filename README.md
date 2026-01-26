@@ -151,7 +151,7 @@ Build PX4 SITL with AddressSanitizer (Does Not Start the simulator yet):
 #-DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
 #make px4_sitl -j"$(nproc)"
 
-PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
+CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 ```
 
 This builds:
@@ -164,10 +164,24 @@ This builds:
 
 ## 5. Run AFL++ Persistent Fuzzing
 
+
+```bash
+cd .. 
+
+# Make sure all the cores of the processor are set to performace mode. These canse be set back to 
+# normal using the ubuntu performace settings
+cd /sys/devices/system/cpu
+sudo echo performace | tee cpu*/cpufreq/scaling_governor
+
+cd - 
+```
+
 Run the harness in a second terminal:
 
 ```bash
 cd .. 
+
+#Make sure the processor is set to performace mode 
 
 AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
