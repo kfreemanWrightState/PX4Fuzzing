@@ -73,6 +73,9 @@ sudo pip3 install --upgrade python-afl --break-system-packages
 Clone this project:
 
 ```bash
+mkdir -p px4 
+cd px4 
+
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
 cd PX4Fuzzing
 ```
