@@ -126,6 +126,15 @@ CMAKE_ARGS="-DCMAKE_INSTALL_PREFIX=$HOME/.local \
 -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
 make px4_sitl gz_x500 -j"$(nproc)"
 
+export LD_PRELOAD="$PWD/../scripts/libgcov_flush.so${LD_PRELOAD:+:$LD_PRELOAD}"\
+PX4_CMAKE_BUILD_TYPE=Coverage \
+CC=clang CXX=clang++ \
+CMAKE_ARGS=" \
+-DCMAKE_C_FLAGS='-fsanitize=address' \
+-DCMAKE_CXX_FLAGS='-fsanitize=address' \
+-DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
+make px4_sitl -j"$(nproc)"
+
 cat > /tmp/llvm-gcov.sh <<'EOF'
 #!/usr/bin/env bash
 exec llvm-cov gcov "$@"

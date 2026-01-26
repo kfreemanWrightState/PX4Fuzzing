@@ -124,17 +124,115 @@ class CoverageReporter:
         print("[coverage] $ " + " ".join(cmd), flush=True)
         subprocess.run(cmd, check=True)
 
+    def _newest_gcda_mtime(self) -> float:
+        # find newest .gcda timestamp under build_dir
+        newest = 0.0
+        for p in self.cfg.build_dir.rglob("*.gcda"):
+            try:
+                newest = max(newest, p.stat().st_mtime)
+            except FileNotFoundError:
+                pass
+        return newest
+
+    def _write_proof_file(self, html_dir: Path, gcda_mtime: float) -> None:
+        # writes a tiny file into the HTML dir so you can confirm which inputs were used
+        proof = html_dir / "_proof.txt"
+        proof.write_text(
+            f"generated_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"build_dir={self.cfg.build_dir}\n"
+            f"repo_root={self.cfg.repo_root}\n"
+            f"newest_gcda_mtime={gcda_mtime}\n",
+            encoding="utf-8"
+        )
+        
+    def _flush_px4_gcov(self) -> None:
+        """
+        Ask PX4 to flush coverage counters to .gcda.
+        This assumes your PX4 process has a SIGUSR1 handler that calls __gcov_flush()
+        via LD_PRELOAD or an in-tree implementation.
+        """
+        # Best effort: don't fail if pkill finds nothing
+        subprocess.run(
+            ["bash", "-lc", "pkill -USR1 -f 'px4_sitl_default/bin/px4' || true"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.25)  # give filesystem a moment
+
+    def _newest_gcda_mtime(self) -> float:
+        """
+        Return newest mtime among all .gcda under build_dir. 0.0 if none found.
+        """
+        newest = 0.0
+        for p in self.cfg.build_dir.rglob("*.gcda"):
+            try:
+                mt = p.stat().st_mtime
+                if mt > newest:
+                    newest = mt
+            except FileNotFoundError:
+                continue
+        return newest
+
+    def _write_proof_file(self, html_dir: Path, gcda_mtime: float, info_path: Path) -> None:
+        """
+        Write a small proof file so you can confirm reports are changing.
+        Stores:
+          - newest gcda mtime
+          - sha256 of lcov info
+          - timestamp
+        """
+        try:
+            # sha256 of the info file
+            h = subprocess.check_output(
+                ["bash", "-lc", f"sha256sum '{info_path}' | awk '{{print $1}}'"],
+                text=True
+            ).strip()
+
+            proof = html_dir / "proof.txt"
+            proof.write_text(
+                "coverage proof\n"
+                f"generated_ts    : {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"newest_gcda_mtime: {gcda_mtime:.3f}\n"
+                f"lcov_info       : {info_path.name}\n"
+                f"lcov_sha256     : {h}\n",
+                encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"[coverage] warning: failed to write proof file: {e}", flush=True)
+
     def generate_once(self) -> Path:
         cfg = self.cfg
         cfg.run_root.mkdir(parents=True, exist_ok=True)
         cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+        # --- 1) Force PX4 to flush gcov counters to .gcda ---
+        # Requires you started PX4 with LD_PRELOAD=./scripts/libgcov_flush.so
+        # (or another mechanism that makes SIGUSR1 call __gcov_flush()).
+        self._flush_px4_gcov()
 
+        # --- 2) Freshness gate: confirm .gcda is updating ---
+        gcda_mtime = self._newest_gcda_mtime()
+        now = time.time()
+
+        if gcda_mtime == 0.0:
+            raise RuntimeError(f"No .gcda files found under {cfg.build_dir}")
+
+        # We expect at least *some* gcda touched very recently after flush.
+        # Tune the window if your system is slow.
+        if (now - gcda_mtime) > 10:
+            raise RuntimeError(
+                f"Newest .gcda is too old ({now - gcda_mtime:.1f}s). "
+                f"Either PX4 isn't flushing coverage, or build_dir is wrong: {cfg.build_dir}"
+            )
+
+        # --- 3) Paths for this report ---
         ts = time.strftime("%Y%m%d_%H%M%S")
         info_path = cfg.run_root / f"lcov_{ts}.info"
         html_dir = cfg.run_root / f"html_{ts}"
         index_html = html_dir / "index.html"
 
+        # --- 4) lcov / genhtml commands (REAL LISTS, NO "...") ---
         lcov_cmd = [
             "lcov",
             "--directory", str(cfg.build_dir),
@@ -154,12 +252,19 @@ class CoverageReporter:
             genhtml_cmd += ["--synthesize-missing"]
         genhtml_cmd += [str(info_path), "-o", str(html_dir)]
 
+        # --- 5) Run ---
         self._run_cmd(lcov_cmd)
         self._run_cmd(genhtml_cmd)
 
         if not index_html.exists():
             raise RuntimeError(f"Expected {index_html} to exist, but it doesn't.")
+
+        # --- 6) Proof/debug breadcrumbs (optional but helpful) ---
+        self._write_proof_file(html_dir, gcda_mtime, info_path)
+
         return index_html
+
+
 
     def maybe_open_firefox(self, index_html: Path) -> None:
         if not self.cfg.open_firefox:

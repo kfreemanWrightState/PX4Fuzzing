@@ -49,7 +49,7 @@ sudo apt update && sudo apt-get upgrade -y
 
 sudo apt install -y \
   gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-gl \
-  libfuse2 \
+  libfuse2t64 \
   libxcb-xinerama0 libxkbcommon-x11-0 libxcb-cursor-dev \
   build-essential cmake ninja-build ccache \
   clang lld \
@@ -57,7 +57,7 @@ sudo apt install -y \
   libc++-dev libc++abi-dev \
   python3 python3-pip git \
   valgrind afl++ \
-  wget unzip tar llcov
+  wget unzip tar lcov
 ```
 
 Install python-afl:
@@ -143,15 +143,15 @@ Build PX4 SITL with AddressSanitizer (Does Not Start the simulator yet):
 
 ```bash
 
-PX4_CMAKE_BUILD_TYPE=Coverage \
-CC=clang CXX=clang++ \
-CMAKE_ARGS="\
--DCMAKE_C_FLAGS='-fsanitize=address' \
--DCMAKE_CXX_FLAGS='-fsanitize=address' \
--DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
-make px4_sitl -j"$(nproc)"
+#PX4_CMAKE_BUILD_TYPE=Coverage \
+#CC=clang CXX=clang++ \
+#CMAKE_ARGS="\
+#-DCMAKE_C_FLAGS='-fsanitize=address' \
+#-DCMAKE_CXX_FLAGS='-fsanitize=address' \
+#-DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
+#make px4_sitl -j"$(nproc)"
 
-#PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
+PX4_CMAKE_BUILD_TYPE=Coverage CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 ```
 
 This builds:

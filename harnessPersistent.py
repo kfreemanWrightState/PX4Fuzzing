@@ -111,14 +111,29 @@ def start_px4():
     px4_dir = PX4_DIR
     num_procs = os.getenv("NUM_PROCS", str(os.cpu_count() or 4))
 
-    make_cmd = (
+    '''make_cmd = (
+        f'export LD_PRELOAD="$PWD/scripts/libgcov_flush.so${LD_PRELOAD:+:$LD_PRELOAD}"'
         f'PX4_CMAKE_BUILD_TYPE=Coverage '
         f'CC=clang CXX=clang++ '
         f'CMAKE_ARGS="-DCMAKE_C_FLAGS=-fsanitize=address '
         f'-DCMAKE_CXX_FLAGS=-fsanitize=address '
         f'-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address" '
         f'make px4_sitl gz_x500 -j{num_procs}'
-    )
+    )'''
+
+
+    '''make_cmd = (
+        f'PX4_CMAKE_BUILD_TYPE=Coverage '
+        f'CC=clang CXX=clang++ '
+        f'CMAKE_ARGS="-DCMAKE_C_FLAGS=-fsanitize=address '
+        f'-DCMAKE_CXX_FLAGS=-fsanitize=address '
+        f'-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address" '
+        f'make px4_sitl gz_x500 -j{num_procs}'
+    )'''
+
+    make_cmd = f"CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl gz_x500 -j{num_procs}"
+    
+    ld_preload_cmd = ""
 
     print(make_cmd)
 
@@ -144,7 +159,17 @@ def start_px4():
         term_log = open("/tmp/px4_gnome_terminal.log", "ab", buffering=0)
 
         # ONE bash -lc layer only; no extra quoting games
-        bash_line = f'cd "{px4_dir}" && {make_cmd}; exec bash'
+        #bash_line = (
+        #    'export LD_PRELOAD=$PWD/../scripts/libgcov_flush.so:${LD_PRELOAD}; '
+        #    f'cd "{px4_dir}" && {make_cmd}; exec bash'
+        #)
+        bash_line = (
+        f'cd "{px4_dir}" && '
+        #f'LD_PRELOAD="$PWD/../scripts/libgcov_flush.so${{LD_PRELOAD:+:$LD_PRELOAD}}" '
+        f'{make_cmd}; '
+        f'exec bash'
+)
+        print("BASH_LINE:", bash_line, flush=True)
 
         cmd = [
             "gnome-terminal",
@@ -154,6 +179,7 @@ def start_px4():
         ]
 
         log(f"[start_px4] launching: {cmd}")
+
         subprocess.Popen(cmd, stdout=term_log, stderr=term_log)
 
     finally:
@@ -170,8 +196,6 @@ def start_px4():
     log("[start_px4] waiting 15s to let PX4 and simulator fully settle")
     time.sleep(15.0)
     log("[start_px4] start complete")
-
-
 
 def start_px42():
     """
@@ -539,10 +563,10 @@ def afl_main_loop():
     # Prepare TX connection and lifeline threads BEFORE afl.init() ideally so parent keeps connection:
     connect_tx()
 
-    cov_t = start_coverage_thread_from_ini(
-        ini_path="coverage.ini",
-        findings_dir=None,     # use fallback_findings_dir
-    )
+    #cov_t = start_coverage_thread_from_ini(
+    #    ini_path="coverage.ini",
+    #    findings_dir=None,     # use fallback_findings_dir
+    #)
     hb_stop = threading.Event()
     sp_stop = threading.Event()
     hb_t = threading.Thread(target=gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
