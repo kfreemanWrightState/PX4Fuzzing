@@ -3,4 +3,7 @@ QGroundControl-x86_64.AppImage
 findings/
 qgroundcontrol/
 seeds/
+AFL_BUILD_PX4-Autopilot/
+__pycache__/
+*.so
 
