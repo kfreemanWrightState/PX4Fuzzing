@@ -40,6 +40,15 @@ For improved Gazebo performance:
 - A GPU that supports **OpenGL 3.3+**
 - Proprietary NVIDIA/AMD drivers (optional but helpful)
 
+# Setup Instructions
+To setup the fuzzing envrionment either run the setup script below which will run 
+the entire Setup process or follow the Setup Steps one at a time. 
+
+## Option 1 : Run the setup script
+
+./setup_px4_fuzzing.sh
+
+## Option 2 : Run the the Setup Steps One at a Time 
 ---
 
 ## 1. Install All Required Packages
