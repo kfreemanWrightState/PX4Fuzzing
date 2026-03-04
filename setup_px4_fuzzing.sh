@@ -64,14 +64,32 @@ echo
 # STEP 3: Clone Repositories
 #############################################
 echo "[STEP 3] Cloning repositories"
+REPO_URL="https://github.com/kfreemanWrightState/PX4Fuzzing.git"
+DIR="PX4Fuzzing"
 
-if [[ ! -d PX4Fuzzing ]]; then
-  git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
+if [[ -d "$DIR/.git" ]]; then
+    echo "PX4Fuzzing repo already exists"
+
+    CURRENT_REMOTE=$(git -C "$DIR" config --get remote.origin.url)
+
+    if [[ "$CURRENT_REMOTE" == "$REPO_URL" ]]; then
+        echo "Correct repo found, fetching all branches..."
+        git -C "$DIR" fetch --all --prune
+    else
+        echo "Directory exists but is not the correct repo!"
+        exit 1
+    fi
+
 else
-  echo "PX4Fuzzing already exists, skipping clone"
+    echo "Cloning repository..."
+    git clone "$REPO_URL" "$DIR"
 fi
 
-cd PX4Fuzzing
+# change into repo directory
+cd "$DIR" || { echo "Failed to enter repo directory"; exit 1; }
+
+echo "Now in repo directory: $(pwd)"
+
 
 if [[ ! -d PX4-Autopilot ]]; then
   git clone https://github.com/PX4/PX4-Autopilot.git --recursive
