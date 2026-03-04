@@ -48,7 +48,7 @@ the entire setup process or follow the setup steps one at a time.
 
 ./setup_px4_fuzzing.sh
 
-## Option 2 : Run the setup steps one at a ime 
+## Option 2 : Run the setup steps one at a time 
 ---
 
 ## 1. Install All Required Packages
