@@ -48,6 +48,9 @@ may take up to an hour mor more to complete.
 ## Option 1 : Run the setup script
 > **Note:** The setup script downloads multiple repositories and dependencies.  
 > Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
+>
+> If the script is **not executed as root**, you will be prompted to enter your **sudo password twice**
+> during the installation process.
 
 ```bash
 ./setup_px4_fuzzing.sh
@@ -99,6 +102,8 @@ git clone https://github.com/PX4/PX4-Autopilot.git --recursive
 ```
 
 Clone QGroundControl source (optional):
+> **Note:** This is an optional piece of software that can be used to interact with the PX4 Software in the Loop
+> It is not needed or used during the fuzzing process.   
 
 ```bash
 git clone https://github.com/mavlink/qgroundcontrol.git
