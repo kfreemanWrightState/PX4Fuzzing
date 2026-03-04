@@ -42,13 +42,13 @@ For improved Gazebo performance:
 
 # Setup Instructions
 To setup the fuzzing envrionment either run the setup script below which will run 
-the entire Setup process or follow the Setup Steps one at a time. 
+the entire setup process or follow the setup steps one at a time. 
 
 ## Option 1 : Run the setup script
 
 ./setup_px4_fuzzing.sh
 
-## Option 2 : Run the the Setup Steps One at a Time 
+## Option 2 : Run the setup steps one at a ime 
 ---
 
 ## 1. Install All Required Packages
