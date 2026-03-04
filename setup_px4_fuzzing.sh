@@ -97,18 +97,18 @@ else
   echo "PX4-Autopilot already exists, skipping clone"
 fi
 
-if [[ ! -d qgroundcontrol ]]; then
-  git clone https://github.com/mavlink/qgroundcontrol.git
-else
-  echo "QGroundControl source already exists, skipping clone"
-fi
+#if [[ ! -d qgroundcontrol ]]; then
+#  git clone https://github.com/mavlink/qgroundcontrol.git
+#else
+#  echo "QGroundControl source already exists, skipping clone"
+#fi
 
-if [[ ! -f QGroundControl-x86_64.AppImage ]]; then
-  wget https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage
-  chmod +x QGroundControl-x86_64.AppImage
-else
-  echo "QGroundControl AppImage already downloaded"
-fi
+#if [[ ! -f QGroundControl-x86_64.AppImage ]]; then
+#  wget https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage
+#  chmod +x QGroundControl-x86_64.AppImage
+#else
+#  echo "QGroundControl AppImage already downloaded"
+#fi
 
 echo "Repositories ready"
 echo
@@ -183,9 +183,8 @@ echo
 #############################################
 echo "[STEP 9] Ready to start AFL++ persistent fuzzing"
 echo
-echo "Run the following command manually when ready:"
+echo "Setup complete. Navigate to the directory containing harnessPersistent.py and run the following command manually:"
 echo
-echo "cd PX4Fuzzing"
 echo "AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 \\"
 echo "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\"
 echo "py-afl-fuzz -t 2000 -i seeds -o findings -- \\"

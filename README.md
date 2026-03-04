@@ -110,6 +110,8 @@ git clone https://github.com/mavlink/qgroundcontrol.git
 ```
 
 Download the prebuilt QGroundControl AppImage (optional):
+> **Note:** This is an optional piece of software that can be used to interact with the PX4 Software in the Loop
+> It is not needed or used during the fuzzing process.   
 
 ```bash
 wget https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage
