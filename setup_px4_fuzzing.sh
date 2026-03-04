@@ -64,31 +64,31 @@ echo
 # STEP 3: Clone Repositories
 #############################################
 echo "[STEP 3] Cloning repositories"
-REPO_URL="https://github.com/kfreemanWrightState/PX4Fuzzing.git"
-DIR="PX4Fuzzing"
+#REPO_URL="https://github.com/kfreemanWrightState/PX4Fuzzing.git"
+#DIR="PX4Fuzzing"
 
-if [[ -d "$DIR/.git" ]]; then
-    echo "PX4Fuzzing repo already exists"
+#if [[ -d "$DIR/.git" ]]; then
+#    echo "PX4Fuzzing repo already exists"
 
-    CURRENT_REMOTE=$(git -C "$DIR" config --get remote.origin.url)
+#    CURRENT_REMOTE=$(git -C "$DIR" config --get remote.origin.url)
 
-    if [[ "$CURRENT_REMOTE" == "$REPO_URL" ]]; then
-        echo "Correct repo found, fetching all branches..."
-        git -C "$DIR" fetch --all --prune
-    else
-        echo "Directory exists but is not the correct repo!"
-        exit 1
-    fi
+#    if [[ "$CURRENT_REMOTE" == "$REPO_URL" ]]; then
+#        echo "Correct repo found, fetching all branches..."
+#        git -C "$DIR" fetch --all --prune
+#    else
+#        echo "Directory exists but is not the correct repo!"
+#        exit 1
+#    fi
 
-else
-    echo "Cloning repository..."
-    git clone "$REPO_URL" "$DIR"
-fi
+#else
+#    echo "Cloning repository..."
+#    git clone "$REPO_URL" "$DIR"
+#fi
 
 # change into repo directory
-cd "$DIR" || { echo "Failed to enter repo directory"; exit 1; }
+#cd "$DIR" || { echo "Failed to enter repo directory"; exit 1; }
 
-echo "Now in repo directory: $(pwd)"
+#echo "Now in repo directory: $(pwd)"
 
 
 if [[ ! -d PX4-Autopilot ]]; then

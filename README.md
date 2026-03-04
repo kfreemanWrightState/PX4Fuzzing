@@ -42,12 +42,16 @@ For improved Gazebo performance:
 
 # Setup Instructions
 To setup the fuzzing envrionment either run the setup script below which will run 
-the entire setup process or follow the setup steps one at a time. 
+the entire setup process or follow the setup steps one at a time. The setup process 
+may take up to an hour mor more to complete.  
 
 ## Option 1 : Run the setup script
+> **Note:** The setup script downloads multiple repositories and dependencies.  
+> Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
 
+```bash
 ./setup_px4_fuzzing.sh
-
+```
 ## Option 2 : Run the setup steps one at a time 
 ---
 
@@ -87,6 +91,8 @@ cd PX4Fuzzing
 ```
 
 Clone PX4:
+> **Note:** This step downloads multiple repositories and dependencies.  
+> Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
 
 ```bash
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive
