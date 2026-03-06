@@ -54,13 +54,9 @@ may take up to an hour mor more to complete.
 
 ```bash
 sudo apt-get update
-
 sudo apt-get install git 
-
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
-
 cd PX4Fuzzing
-
 ./setup_px4_fuzzing.sh
 ```
 ## Option 2 : Run the setup steps one at a time 
