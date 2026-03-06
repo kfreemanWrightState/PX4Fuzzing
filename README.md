@@ -58,6 +58,9 @@ sudo apt install git
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
 cd PX4Fuzzing
 ./setup_px4_fuzzing.sh
+
+AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
+py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
 ```
 ## Option 2 : Run the setup steps one at a time 
 ---
