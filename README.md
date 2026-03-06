@@ -49,10 +49,18 @@ may take up to an hour mor more to complete.
 > **Note:** The setup script downloads multiple repositories and dependencies.  
 > Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
 >
-> If the script is **not executed as root**, you will be prompted to enter your **sudo password twice**
+> If the script is **not executed as root**, you will be prompted to enter your **sudo password**
 > during the installation process.
 
 ```bash
+sudo apt-get update
+
+sudo apt-get install git 
+
+git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
+
+cd PX4Fuzzing
+
 ./setup_px4_fuzzing.sh
 ```
 ## Option 2 : Run the setup steps one at a time 
@@ -251,6 +259,7 @@ pkill -f gz
 
 ### **PX4 Fuzz Testing**
 - https://docs.px4.io/main/en/test_and_ci/fuzz_tests#running-fuzz-tests
+- https://github.com/BOB4Drone/Drone_Hacking_Guideline_ENG/tree/main
 
 ### **AFL++**
 - https://aflplus.plus/
@@ -265,7 +274,8 @@ pkill -f gz
 - https://arxiv.org/html/2501.18874v2?utm_source=chatgpt.com
 - https://cosicdatabase.esat.kuleuven.be/backend/publications/files/conferencepaper/2667?utm_source=chatgpt.com
 
-### **Drone Security Research (DJI / OcuSync / DroneID)**
+### **Other Embedded System Fuzzing Research**
 - https://www.ndss-symposium.org/wp-content/uploads/2023/02/ndss2023_f217_paper.pdf
+- https://www.ndss-symposium.org/ndss-paper/pgfuzz-policy-guided-fuzzing-for-robotic-vehicles/
 
 ---
