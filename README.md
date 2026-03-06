@@ -53,8 +53,8 @@ may take up to an hour mor more to complete.
 > during the installation process.
 
 ```bash
-sudo apt-get update
-sudo apt-get install git 
+sudo apt update
+sudo apt install git 
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
 cd PX4Fuzzing
 ./setup_px4_fuzzing.sh
