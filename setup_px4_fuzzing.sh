@@ -17,12 +17,15 @@ echo "[INIT] Requesting sudo privileges (only once) for the script"
 
 sudo -v
 
-# keep sudo alive while script runs
 while true; do
   sudo -n true
   sleep 60
   kill -0 "$$" || exit
 done 2>/dev/null &
+
+SUDO_KEEPALIVE_PID=$!
+
+trap 'kill $SUDO_KEEPALIVE_PID' EXIT
 
 #############################################
 # STEP 0: Sanity Checks
