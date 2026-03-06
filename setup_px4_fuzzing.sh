@@ -10,6 +10,19 @@ echo "=============================================="
 echo " PX4 AFL++ Persistent Fuzzing Environment Setup"
 echo "=============================================="
 echo
+#############################################
+# STEP -1: Acquire sudo once
+#############################################
+echo "[INIT] Requesting sudo privileges (only once) for the script"
+
+sudo -v
+
+# keep sudo alive while script runs
+while true; do
+  sudo -n true
+  sleep 60
+  kill -0 "$$" || exit
+done 2>/dev/null &
 
 #############################################
 # STEP 0: Sanity Checks
