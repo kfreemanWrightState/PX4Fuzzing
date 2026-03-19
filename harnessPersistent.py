@@ -34,7 +34,7 @@ from pymavlink import mavutil
 from pymavlink.dialects.v20 import common as mavlink2  # for explicit enums
 import afl  # python-afl - provides afl.loop()/afl.init()
 
-from cov_reporter import start_coverage_thread_from_ini
+#from cov_reporter import start_coverage_thread_from_ini
 
 # --------------------- Configuration (env overrides) ---------------------
 MAVLINK_HOST = os.getenv("MAVLINK_HOST", "127.0.0.1")   # PX4 IP for UDP

@@ -40,6 +40,29 @@ For improved Gazebo performance:
 - A GPU that supports **OpenGL 3.3+**
 - Proprietary NVIDIA/AMD drivers (optional but helpful)
 
+# Setup Instructions
+To setup the fuzzing envrionment either run the setup script below which will run 
+the entire setup process or follow the setup steps one at a time. The setup process 
+may take up to an hour mor more to complete.  
+
+## Option 1 : Run the setup script
+> **Note:** The setup script downloads multiple repositories and dependencies.  
+> Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
+>
+> If the script is **not executed as root**, you will be prompted to enter your **sudo password**
+> during the installation process.
+
+```bash
+sudo apt update
+sudo apt install git 
+git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
+cd PX4Fuzzing
+./setup_px4_fuzzing.sh
+
+AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
+py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
+```
+## Option 2 : Run the setup steps one at a time 
 ---
 
 ## 1. Install All Required Packages
@@ -78,18 +101,24 @@ cd PX4Fuzzing
 ```
 
 Clone PX4:
+> **Note:** This step downloads multiple repositories and dependencies.  
+> Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
 
 ```bash
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive
 ```
 
 Clone QGroundControl source (optional):
+> **Note:** This is an optional piece of software that can be used to interact with the PX4 Software in the Loop
+> It is not needed or used during the fuzzing process.   
 
 ```bash
 git clone https://github.com/mavlink/qgroundcontrol.git
 ```
 
 Download the prebuilt QGroundControl AppImage (optional):
+> **Note:** This is an optional piece of software that can be used to interact with the PX4 Software in the Loop
+> It is not needed or used during the fuzzing process.   
 
 ```bash
 wget https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage
@@ -229,6 +258,7 @@ pkill -f gz
 
 ### **PX4 Fuzz Testing**
 - https://docs.px4.io/main/en/test_and_ci/fuzz_tests#running-fuzz-tests
+- https://github.com/BOB4Drone/Drone_Hacking_Guideline_ENG/tree/main
 
 ### **AFL++**
 - https://aflplus.plus/
@@ -243,7 +273,8 @@ pkill -f gz
 - https://arxiv.org/html/2501.18874v2?utm_source=chatgpt.com
 - https://cosicdatabase.esat.kuleuven.be/backend/publications/files/conferencepaper/2667?utm_source=chatgpt.com
 
-### **Drone Security Research (DJI / OcuSync / DroneID)**
+### **Other Embedded System Fuzzing Research**
 - https://www.ndss-symposium.org/wp-content/uploads/2023/02/ndss2023_f217_paper.pdf
+- https://www.ndss-symposium.org/ndss-paper/pgfuzz-policy-guided-fuzzing-for-robotic-vehicles/
 
 ---
