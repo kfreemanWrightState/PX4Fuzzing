@@ -7,13 +7,13 @@ Single-script workflow:
  - optionally start PX4 (via START_CMD),
  - create a persistent MAVLink 'udpout:' connection so we don't reconnect each testcase,
  - run lifeline threads: GCS heartbeat (2 Hz) and Offboard position setpoints (20 Hz),
- - run python-afl persistent loop: read testcase from stdin, send to PX4 quickly,
+ - run a Python-managed fork loop: generate testcase bytes, send to PX4 quickly,
  - monitor PX4 PIDs (zombie or missing) and restart PX4 if needed (uses flock to avoid races).
 
 Notes:
  - For reliability, make your START_CMD spawn px4 directly (avoid gnome-terminal parent).
  - Environment overrides (defaults below) are clearly documented.
- - Requires: python-afl, pymavlink (pip install python-afl pymavlink)
+ - Requires: pymavlink
 """
 import os
 import sys
@@ -34,9 +34,7 @@ import random
 # third-party
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import common as mavlink2  # for explicit enums
-import afl  # python-afl - provides afl.loop()/afl.init()
-
-from cov_reporter import start_coverage_thread_from_ini
+#from cov_reporter import start_coverage_thread_from_ini
 
 # --------------------- Configuration (env overrides) ---------------------
 MAVLINK_HOST = os.getenv("MAVLINK_HOST", "127.0.0.1")   # PX4 IP for UDP
@@ -64,7 +62,9 @@ TARGET_Y = float(os.getenv("TARGET_Y", "0"))
 TARGET_Z = float(os.getenv("TARGET_Z", "-5.0"))        # LOCAL_NED negative = up
 CONFIRM_ALT_M = float(os.getenv("CONFIRM_ALT_M", "2.0"))
 POST_SEND_MS = int(os.getenv("POST_SEND_MS", "30"))    # dwell after send to let crash manifest
-MAX_INPUT = int(os.getenv("MAX_INPUT", "8192"))       # max bytes read from AFL
+MAX_INPUT = int(os.getenv("MAX_INPUT", "8192"))        # max bytes generated per testcase
+MIN_INPUT = int(os.getenv("MIN_INPUT", "1"))
+PX4_STARTUP_WAIT_S = float(os.getenv("PX4_STARTUP_WAIT_S", "65"))
 LOGFILE          = os.getenv("HARNESS_LOG", "/tmp/combined_fuzz.log")
 RESTART_LOCK     = os.getenv("PX4_RESTART_LOCK", "/tmp/px4_restart.lock")
 
@@ -76,7 +76,8 @@ GCS_COMPONENT_ID = int(os.getenv(
 
 UNSUPPORTED_COMMAND_ID = int(os.getenv("UNSUPPORTED_COMMAND_ID", "5000"))
 
-AFL_ITERATIONS = 1000
+FORKSERVER_ITERATIONS = int(os.getenv("FORKSERVER_ITERATIONS", "1000"))
+HARNESS_SEED = os.getenv("HARNESS_SEED")
 
 vehicle_ready = False
 
@@ -272,7 +273,7 @@ def save_last_case(buf, why="case", out_dir="/tmp/mission_fuzz_cases"):
 
 def px4_alive_or_die(current_input: bytes):
     """
-    If PX4 dies, force this python process to exit nonzero so AFL records a crash input.
+    If PX4 dies, force this python process to exit nonzero so the parent can record it.
     """
     pids = read_px4_pids()
     if not pids:
@@ -280,7 +281,6 @@ def px4_alive_or_die(current_input: bytes):
     alive = all(is_pid_alive_not_zombie(p) for p in pids)
     if not alive:
         save_last_case(current_input, why="px4_died")
-        # Important: make AFL see a "crash"
         os._exit(1)
 
 def wait_heartbeat(m):
@@ -438,11 +438,16 @@ def upload_mission(m, items, mission_type=mavutil.mavlink.MAV_MISSION_TYPE_MISSI
 
 # -------------------------------------------------------------------------
 
-# simple logging helper (nonblocking to not slow AFL)
+# simple logging helper
 _log_fh = open(LOGFILE, "a", buffering=1) if LOGFILE else None
 def log(msg):
     if _log_fh:
         _log_fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def wait_for_px4_settle(reason: str):
+    log(f"[wait_for_px4_settle] waiting {PX4_STARTUP_WAIT_S:.0f}s for PX4 startup ({reason})")
+    time.sleep(PX4_STARTUP_WAIT_S)
 
 # -------------------- PX4 start / PID management -------------------------
 def ensure_px4_running():
@@ -455,15 +460,16 @@ def ensure_px4_running():
     if not pids:
         log("[ensure_px4_running] no pids found; starting PX4")
         start_px4()
-        return
+        return True
 
     alive = [is_pid_alive_not_zombie(p) for p in pids]
     if all(alive):
         log(f"[ensure_px4_running] PX4 appears already running (pids={pids})")
-        return
+        return False
 
     log(f"[ensure_px4_running] some PX4 pids dead/zombie ({pids}); restarting")
     start_px4()
+    return True
 
 
 def start_px4():
@@ -552,8 +558,7 @@ def start_px4():
 
     time.sleep(5.0)
     snap_px4_pids()
-    log("[start_px4] waiting 15s to let PX4 and simulator fully settle")
-    time.sleep(15.0)
+    wait_for_px4_settle("PX4 launch")
     log("[start_px4] start complete")
 
 def start_px42():
@@ -605,8 +610,7 @@ def start_px42():
     time.sleep(5.0)
     snap_px4_pids()
 
-    log("[start_px4] waiting 15s to let PX4 and simulator fully settle")
-    time.sleep(15.0)
+    wait_for_px4_settle("PX4 launch")
     log("[start_px4] start complete")
 
 def snap_px4_pids():
@@ -894,117 +898,112 @@ def handle_px4_failure_and_restart():
         kill_existing_px4()
         kill_gazebo()
         start_px4()
-        # Reconnect TX (retry a few times)
-        for _ in range(10):
-            if connect_tx():
-                break
-            time.sleep(1.0)
-        # Re-prepare vehicle once per restart
-        if connect_tx():
-            if prepare_vehicle_offboard():
-                log("[restart] vehicle re-armed and in OFFBOARD")
-            else:
-                log("[restart] vehicle prepare failed; will keep trying during fuzz")
-        arm_once(wait_s=6)
-        wait_alt()
         vehicle_ready = True
     except Exception as e:
         log(f"[restart] error: {e}")
         vehicle_ready = False
 
-# ---------------------- AFL persistent harness loop -----------------------
-def safe_afl_init():
-    try: afl.init()
-    except RuntimeError as e:
-        if "AFL already initialized" not in str(e): raise
+# ---------------------- Python forkserver harness loop ---------------------
+def make_case_generator():
+    rng = random.Random()
+    if HARNESS_SEED is not None:
+        rng.seed(int(HARNESS_SEED))
+        log(f"[make_case_generator] using deterministic seed {HARNESS_SEED}")
+    else:
+        seed_bytes = os.urandom(16)
+        rng.seed(int.from_bytes(seed_bytes, "little"))
+        log("[make_case_generator] using os.urandom seed")
+    return rng
 
-def missionLoop():
-    # Prepare TX connection and lifeline threads BEFORE afl.init() ideally so parent keeps connection:
-    connect_tx()
 
-    #cov_t = start_coverage_thread_from_ini(
-    #    ini_path="coverage.ini",
-    #    findings_dir=None,     # use fallback_findings_dir
-    #)
+def generate_random_case(rng):
+    if MAX_INPUT <= 0:
+        return b"\x00"
+    max_len = max(MIN_INPUT, MAX_INPUT)
+    min_len = max(1, min(MIN_INPUT, max_len))
+    size = rng.randint(min_len, max_len)
+    return bytes(rng.getrandbits(8) for _ in range(size))
+
+
+def run_single_mission_iteration(buf, base_items):
+    global tx
+
+    if not connect_tx():
+        raise RuntimeError("Unable to connect to PX4 MAVLink endpoint")
+
     hb_stop = threading.Event()
-    sp_stop = threading.Event()
     hb_t = threading.Thread(target=gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
-    #sp_t = threading.Thread(target=setpoint_thread, args=(sp_stop,), daemon=True)
-    hb_t.start();
-    #sp_t.start()
+    hb_t.start()
 
-    # Allow ~2 s of heartbeats & setpoints so PX4 sees a valid GCS
-    log("[missionLoop] letting heartbeats run 2s so PX4 detects GCS before offboard/arm")
-    t0 = time.time()
-    while time.time() - t0 < 2.0:
-        try:
-            if tx:
-                tx.recv_match(blocking=False)
-        except Exception:
-            pass
-        time.sleep(0.05)
+    try:
+        log("[run_single_mission_iteration] sending heartbeats for 2s before mission upload")
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            try:
+                if tx:
+                    tx.recv_match(blocking=False)
+            except Exception:
+                pass
+            time.sleep(0.05)
 
-    # Best-effort: set Offboard and arm once at start
-    #set_mode_offboard_once()
-    #arm_once(wait_s=6)
-    #wait_alt()
-
-    #input("start Upload...\n")
-    #clear_mission(tx)
-    #items = build_mission_items()
-    #res = upload_mission(tx, items)
-    #print("Upload result code:", res)
-    #input("end Upload...\n")
-    # --- Mission fuzzing (directed / semantic) ---
-    #safe_afl_init()
-
-    base_items = build_mission_items()
-
-    # Optional: clear once before fuzzing
-    clear_mission(tx)
-
-    while afl.loop():
-        buf = sys.stdin.buffer.read(MAX_INPUT)
-        if not buf:
-            buf = b"\x00"
-
-        # If PX4 already died, make AFL capture this input as crash
         px4_alive_or_die(buf)
 
-        try:
-            # Re-clear mission sometimes to keep state clean
-            if (buf[0] & 0x7) == 0:
-                clear_mission(tx)
+        if (buf[0] & 0x7) == 0:
+            clear_mission(tx)
 
-            items = mutate_mission_from_bytes(buf, base_items, want_len=10)
+        items = mutate_mission_from_bytes(buf, base_items, want_len=10)
+        res = upload_mission_safe(tx, items)
+        save_last_case(buf, why=f"mission_ack_{res}")
 
-            res = upload_mission_safe(tx, items)
-            
-            # Record interesting non-ACCEPTED acks (but don't kill the run)
-            #if res != mavutil.mavlink.MAV_MISSION_ACCEPTED:
-            save_last_case(buf, why=f"mission_ack_{res}")
+        time.sleep(POST_SEND_MS / 1000.0)
+        px4_alive_or_die(buf)
+        return 0
+    except Exception as e:
+        log(f"[run_single_mission_iteration] exception: {e}")
+        save_last_case(buf, why="exception")
+        return 2
+    finally:
+        hb_stop.set()
+        hb_t.join(timeout=1.0)
+        with _tx_lock:
+            try:
+                if tx:
+                    tx.close()
+            except Exception:
+                pass
+            tx = None
 
-            # Small dwell so PX4 has time to crash if you hit something
-            time.sleep(POST_SEND_MS / 1000.0)
 
-            # If the mission triggers a PX4 death, convert to AFL crash
-            px4_alive_or_die(buf)
+def missionLoop():
+    rng = make_case_generator()
+    base_items = build_mission_items()
 
-        except Exception as e:
-            # Save protocol timeouts / exceptions; sometimes these are valuable
-            save_last_case(buf, why="exception")
-            # Don’t exit(1) here unless you want AFL to treat every timeout as a crash
-            # continue
-            pass
-        
-    #FUZZ HERE
-    # cleanup (shouldn't normally reach here while AFL runs)
-    #cov_t.stop()
-    #cov_t.join(timeout=5)
-    hb_stop.set();
-    #sp_stop.set()
-    #sp_t.join(timeout=1.0);
-    hb_t.join(timeout=1.0)
+    log(f"[missionLoop] starting Python fork loop for {FORKSERVER_ITERATIONS} iterations")
+    wait_for_px4_settle("forkserver bootstrap")
+
+    for iteration in range(FORKSERVER_ITERATIONS):
+        buf = generate_random_case(rng)
+        pid = os.fork()
+
+        if pid == 0:
+            exit_code = run_single_mission_iteration(buf or b"\x00", base_items)
+            os._exit(exit_code)
+
+        child_pid, status = os.waitpid(pid, 0)
+        log(f"[missionLoop] child {child_pid} finished with status {status}")
+
+        if os.WIFSIGNALED(status):
+            log(f"[missionLoop] child killed by signal {os.WTERMSIG(status)}; restarting PX4")
+            save_last_case(buf, why="child_signal")
+            handle_px4_failure_and_restart()
+            continue
+
+        exit_code = os.WEXITSTATUS(status)
+        if exit_code == 0:
+            continue
+
+        log(f"[missionLoop] iteration {iteration} returned exit code {exit_code}; restarting PX4")
+        handle_px4_failure_and_restart()
 
 # --------------------------- Send UDP Messages ---------------------------
 
