@@ -1292,6 +1292,7 @@ def missionLoop():
     base_items = build_mission_items()
     hb_stop = threading.Event()
     hb_t = None
+    missions_sent = 0
 
     log(f"[missionLoop] starting Python fork loop for {FORKSERVER_ITERATIONS} iterations")
     if INITIAL_STARTUP_WAIT:
@@ -1322,6 +1323,8 @@ def missionLoop():
 
             child_pid, status = os.waitpid(pid, 0)
             log(f"[missionLoop] child {child_pid} finished with status {status}")
+            missions_sent += 1
+            print(f"\rMissions sent: {missions_sent}", end="", flush=True)
 
             if os.WIFSIGNALED(status):
                 log(f"[missionLoop] child killed by signal {os.WTERMSIG(status)}; restarting PX4")
@@ -1343,6 +1346,8 @@ def missionLoop():
             dump_recent_history("child_exit", trigger_meta={**case_meta, "exit_code": exit_code})
             handle_px4_failure_and_restart()
     finally:
+        if missions_sent:
+            print()
         hb_stop.set()
         if hb_t:
             hb_t.join(timeout=1.0)
