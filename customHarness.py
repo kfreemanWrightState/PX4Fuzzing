@@ -193,11 +193,15 @@ def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
     else:
         L = min(max_len, max(min_len, want_len))
 
-    # Expand/shrink by repeating last waypoint-ish item
+    # Expand/shrink by repeating a stable waypoint-like item so the structure
+    # stays mostly valid as the mission grows.
     while len(items) < L:
-        it = dict(items[-1])
+        template_idx = min(1, len(items) - 1) if len(items) > 1 else 0
+        it = dict(items[template_idx])
         it["seq"] = len(items)
         it["current"] = 0
+        it["command"] = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        it["frame"] = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
         items.append(it)
     items = items[:L]
 
@@ -206,77 +210,92 @@ def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
         it["current"] = 0
     items[0]["current"] = 1
 
-    # Command pools (safe-ish but interesting)
-    NAV_CMDS = [
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-        mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME,
-        mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS,
-        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
-    ]
-    DO_CMDS = [
-        mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
-        mavutil.mavlink.MAV_CMD_DO_SET_CAM_TRIGG_DIST,
-        mavutil.mavlink.MAV_CMD_DO_SET_ROI_LOCATION,
-    ]
-
-    FRAMES = [
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_INT,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-    ]
-
     # Base lat/lon near your current hardcoded location
     base_lat = items[0]["x"]
     base_lon = items[0]["y"]
+    global_frames = [
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_INT,
+    ]
+
+    def bounded_float(raw_bytes, minimum, maximum, default):
+        if len(raw_bytes) < 4:
+            return default
+        value = _f32(raw_bytes)
+        if not math.isfinite(value):
+            return default
+        normalized = (math.tanh(value / 128.0) + 1.0) / 2.0
+        return minimum + normalized * (maximum - minimum)
 
     # Apply per-item mutations from chunks of buf
     # Each item consumes 20 bytes if available.
     for i, it in enumerate(items):
         off = 1 + i * 20
         chunk = buf[off:off+20]
-
-        # choose command/frame
-        if len(chunk) >= 2:
-            sel = chunk[0]
-            it["command"] = (NAV_CMDS + DO_CMDS)[sel % (len(NAV_CMDS) + len(DO_CMDS))]
-            it["frame"] = FRAMES[chunk[1] % len(FRAMES)]
-
-        # fuzz params using floats, including NaN/Inf occasionally
-        p1 = _f32(_pick_from(chunk, 2, 4, 0))
-        p2 = _f32(_pick_from(chunk, 6, 4, 0))
-        p3 = _f32(_pick_from(chunk, 10, 4, 0))
-        p4 = _f32(_pick_from(chunk, 14, 4, 0))
-
-        # Occasionally inject NaN / Inf patterns from bytes
-        if len(chunk) >= 20 and (chunk[18] & 0x1):
-            p4 = float("nan")
-        if len(chunk) >= 20 and (chunk[19] & 0x1):
-            p3 = float("inf") if (chunk[19] & 0x2) else float("-inf")
-
-        it["param1"], it["param2"], it["param3"], it["param4"] = p1, p2, p3, p4
-
-        # lat/lon deltas (bounded but still explores)
-        dlat = _s16(_pick_from(chunk, 0, 2, 0))  # reuse bytes
-        dlon = _s16(_pick_from(chunk, 2, 2, 0))
-        it["x"] = int(base_lat + dlat * 50)      # 50 = ~5e-6 deg steps
-        it["y"] = int(base_lon + dlon * 50)
-
-        # altitude fuzz: -50..+200 meters-ish plus extreme sometimes
-        if len(chunk) >= 8:
-            z = _f32(_pick_from(chunk, 4, 4, 0))
-            if abs(z) < 1e-3:
-                z = float((chunk[4] % 250) - 50)  # -50..199
-            it["z"] = z
-
         it["seq"] = i
         it["autocontinue"] = 1
+        it["frame"] = global_frames[chunk[1] % len(global_frames)] if len(chunk) >= 2 else global_frames[0]
 
-    # Make last item more likely to be LAND/RTL
-    items[-1]["command"] = [mavutil.mavlink.MAV_CMD_NAV_LAND,
-                            mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH][buf[1] % 2 if len(buf) > 1 else 0]
+        # Preserve a sensible mission skeleton:
+        # first = TAKEOFF, middle = mostly WAYPOINT/LOITER, last = LAND/RTL.
+        if i == 0:
+            it["command"] = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+        elif i == len(items) - 1:
+            it["command"] = (
+                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
+                if len(chunk) >= 1 and (chunk[0] & 0x1)
+                else mavutil.mavlink.MAV_CMD_NAV_LAND
+            )
+        else:
+            middle_cmds = [
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME,
+                mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS,
+            ]
+            it["command"] = middle_cmds[chunk[0] % len(middle_cmds)] if len(chunk) >= 1 else middle_cmds[0]
+
+        # Keep coordinates global and near home.
+        dlat = _s16(_pick_from(chunk, 0, 2, 0))
+        dlon = _s16(_pick_from(chunk, 2, 2, 0))
+        step_scale = 10 + (iteration // max(1, MISSION_LEN_GROWTH_EVERY))
+        it["x"] = int(base_lat + dlat * step_scale)
+        it["y"] = int(base_lon + dlon * step_scale)
+
+        # Keep altitude in a mostly realistic relative-alt range.
+        if i == len(items) - 1 and it["command"] == mavutil.mavlink.MAV_CMD_NAV_LAND:
+            it["z"] = 0.0
+        else:
+            it["z"] = bounded_float(_pick_from(chunk, 4, 4, 0), 5.0, 120.0, 20.0)
+
+        # Start from sane defaults, then mutate by command type.
+        it["param1"] = 0.0
+        it["param2"] = 0.0
+        it["param3"] = 0.0
+        it["param4"] = float("nan")
+
+        if it["command"] == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
+            it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 0.0, 15.0, 0.0)
+            it["param2"] = bounded_float(_pick_from(chunk, 10, 4, 0), 0.5, 25.0, 2.0)
+            it["param3"] = bounded_float(_pick_from(chunk, 14, 4, 0), 0.0, 10.0, 0.0)
+            yaw = bounded_float(_pick_from(chunk, 16, 4, 0), -180.0, 180.0, 0.0)
+            it["param4"] = yaw if len(chunk) >= 18 and (chunk[18] & 0x1) else float("nan")
+        elif it["command"] == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
+            it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 0.0, 10.0, 0.0)
+            it["param4"] = float("nan")
+            it["z"] = bounded_float(_pick_from(chunk, 10, 4, 0), 10.0, 80.0, 20.0)
+        elif it["command"] == mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME:
+            it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 1.0, 120.0, 10.0)
+            it["param3"] = bounded_float(_pick_from(chunk, 10, 4, 0), 3.0, 40.0, 10.0)
+        elif it["command"] == mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS:
+            it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 1.0, 10.0, 2.0)
+            it["param3"] = bounded_float(_pick_from(chunk, 10, 4, 0), 3.0, 40.0, 10.0)
+        elif it["command"] == mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH:
+            it["x"] = base_lat
+            it["y"] = base_lon
+            it["z"] = bounded_float(_pick_from(chunk, 6, 4, 0), 10.0, 80.0, 20.0)
+
     return items
 
 
@@ -1138,7 +1157,7 @@ def missionLoop():
     hb_t = None
 
     log(f"[missionLoop] starting Python fork loop for {FORKSERVER_ITERATIONS} iterations")
-    wait_for_px4_settle("forkserver bootstrap")
+    #wait_for_px4_settle("forkserver bootstrap")
     if not connect_parent_tx():
         raise RuntimeError("Unable to establish parent heartbeat channel to PX4")
 
