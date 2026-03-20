@@ -533,7 +533,18 @@ def log(msg):
 
 def wait_for_px4_settle(reason: str):
     log(f"[wait_for_px4_settle] waiting {PX4_STARTUP_WAIT_S:.0f}s for PX4 startup ({reason})")
-    time.sleep(PX4_STARTUP_WAIT_S)
+    total_wait = max(0, int(math.ceil(PX4_STARTUP_WAIT_S)))
+    if total_wait == 0:
+        return
+
+    for remaining in range(total_wait, 0, -1):
+        print(
+            f"\rWaiting for PX4 startup ({reason}): {remaining:02d}s remaining",
+            end="",
+            flush=True,
+        )
+        time.sleep(1)
+    print("\rWaiting for PX4 startup complete.                       ", flush=True)
 
 # -------------------- PX4 start / PID management -------------------------
 def ensure_px4_running():
