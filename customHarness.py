@@ -30,6 +30,7 @@ from pathlib import Path
 import textwrap
 import hashlib
 import random
+import math
 
 # third-party
 from pymavlink import mavutil
@@ -78,6 +79,12 @@ UNSUPPORTED_COMMAND_ID = int(os.getenv("UNSUPPORTED_COMMAND_ID", "5000"))
 
 FORKSERVER_ITERATIONS = int(os.getenv("FORKSERVER_ITERATIONS", "1000"))
 HARNESS_SEED = os.getenv("HARNESS_SEED")
+MISSION_MIN_LEN = int(os.getenv("MISSION_MIN_LEN", "10"))
+MISSION_START_MAX_LEN = int(os.getenv("MISSION_START_MAX_LEN", "30"))
+MISSION_MAX_LEN_CAP = int(os.getenv("MISSION_MAX_LEN_CAP", "1000"))
+MISSION_LEN_GROWTH_STEP = int(os.getenv("MISSION_LEN_GROWTH_STEP", "5"))
+MISSION_LEN_GROWTH_EVERY = int(os.getenv("MISSION_LEN_GROWTH_EVERY", "250"))
+REPORT_SNAPSHOT_INTERVAL_S = int(os.getenv("REPORT_SNAPSHOT_INTERVAL_S", str(4 * 60 * 60)))
 
 vehicle_ready = False
 
@@ -159,18 +166,32 @@ def _pick_from(buf, off, n, default=0):
     return bytes([default]) * n
 
 
-def mutate_mission_from_bytes(buf, base_items, want_len=10):
+def mission_length_window(iteration: int):
+    min_len = max(1, MISSION_MIN_LEN)
+    start_max = max(min_len, MISSION_START_MAX_LEN)
+    cap = max(start_max, MISSION_MAX_LEN_CAP)
+    growth_step = max(1, MISSION_LEN_GROWTH_STEP)
+    growth_every = max(1, MISSION_LEN_GROWTH_EVERY)
+    growth_rounds = max(0, iteration) // growth_every
+    current_max = min(cap, start_max + growth_rounds * growth_step)
+    return min_len, current_max
+
+
+def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
     """
     Semantic mutation: keeps mission structure valid but changes fields based on buf.
     Returns a new list of items (MISSION_ITEM_INT compatible).
     """
     items = [dict(x) for x in base_items]
 
-    # Force length between 10 and 30 using input bytes
+    min_len, max_len = mission_length_window(iteration)
+
+    # Grow the allowable mission length as the fuzz run progresses.
     if len(buf) >= 1:
-        L = 10 + (buf[0] % 21)  # 10..30
+        span = max_len - min_len + 1
+        L = min_len + (buf[0] % span)
     else:
-        L = want_len
+        L = min(max_len, max(min_len, want_len))
 
     # Expand/shrink by repeating last waypoint-ish item
     while len(items) < L:
@@ -259,19 +280,84 @@ def mutate_mission_from_bytes(buf, base_items, want_len=10):
     return items
 
 
-def save_last_case(buf, why="case", out_dir="/tmp/mission_fuzz_cases"):
+def _json_safe_value(value):
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
+def _serialize_mission_items(items):
+    serialized = []
+    for item in items:
+        serialized.append({key: _json_safe_value(value) for key, value in item.items()})
+    return serialized
+
+
+def _periodic_snapshot_path(out_dir):
+    return os.path.join(out_dir, ".last_periodic_snapshot")
+
+
+def should_persist_case(why, out_dir):
+    crash_reasons = {"exception", "px4_died", "child_signal"}
+    if why in crash_reasons:
+        return True, True
+
+    if REPORT_SNAPSHOT_INTERVAL_S <= 0:
+        return False, False
+
+    marker_path = _periodic_snapshot_path(out_dir)
+    now = time.time()
+    last_snapshot = 0.0
+    try:
+        last_snapshot = float(Path(marker_path).read_text(encoding="utf-8").strip() or "0")
+    except Exception:
+        last_snapshot = 0.0
+
+    if now - last_snapshot >= REPORT_SNAPSHOT_INTERVAL_S:
+        try:
+            Path(marker_path).write_text(str(now), encoding="utf-8")
+        except Exception:
+            pass
+        return True, True
+
+    return False, False
+
+
+def save_last_case(buf, why="case", out_dir="/tmp/mission_fuzz_cases", mission_items=None, meta=None):
     os.makedirs(out_dir, exist_ok=True)
+    should_save_raw, should_save_details = should_persist_case(why, out_dir)
+    if not should_save_raw and not should_save_details:
+        return None
+
     h = hashlib.sha1(buf).hexdigest()
     p = os.path.join(out_dir, f"{why}_{h}.bin")
-    try:
-        with open(p, "wb") as f:
-            f.write(buf)
-    except Exception:
-        pass
+    if should_save_raw:
+        try:
+            with open(p, "wb") as f:
+                f.write(buf)
+        except Exception:
+            pass
+    if should_save_details and (mission_items is not None or meta is not None):
+        details_path = os.path.join(out_dir, f"{why}_{h}.json")
+        payload = {
+            "why": why,
+            "sha1": h,
+            "input_len": len(buf),
+            "meta": meta or {},
+            "mission_items": _serialize_mission_items(mission_items or []),
+        }
+        try:
+            with open(details_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
     return p
 
 
-def px4_alive_or_die(current_input: bytes):
+def px4_alive_or_die(current_input: bytes, mission_items=None, meta=None):
     """
     If PX4 dies, force this python process to exit nonzero so the parent can record it.
     """
@@ -280,7 +366,7 @@ def px4_alive_or_die(current_input: bytes):
         return
     alive = all(is_pid_alive_not_zombie(p) for p in pids)
     if not alive:
-        save_last_case(current_input, why="px4_died")
+        save_last_case(current_input, why="px4_died", mission_items=mission_items, meta=meta)
         os._exit(1)
 
 def wait_heartbeat(m):
@@ -735,6 +821,8 @@ def kill_gazebo(timeout_s: float = 10.0):
 tx = None
 _tx_lock = threading.Lock()
 _last_hb = 0.0
+parent_tx = None
+_parent_tx_lock = threading.Lock()
 
 def connect_tx(timeout=20):
     """Create a persistent udpout MAVLink TX connection and send an initial heartbeat."""
@@ -754,6 +842,25 @@ def connect_tx(timeout=20):
         except Exception as e:
             log(f"[connect_tx] failed: {e}")
             tx = None
+            return False
+
+
+def connect_parent_tx(timeout=20):
+    """Create the parent's long-lived MAVLink connection for continuous GCS heartbeats."""
+    global parent_tx
+    with _parent_tx_lock:
+        try:
+            conn_str = f"udp:{MAVLINK_HOST}:{MAVLINK_PORT}"
+            parent_tx = mavutil.mavlink_connection(conn_str, source_system=GCS_SYSTEM_ID)
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                if parent_tx.recv_match(type='HEARTBEAT', blocking=True, timeout=1):
+                    log("[connect_parent_tx] connected parent heartbeat channel")
+                    return True
+            raise TimeoutError("No HEARTBEAT from PX4 on parent heartbeat channel")
+        except Exception as e:
+            log(f"[connect_parent_tx] failed: {e}")
+            parent_tx = None
             return False
 
 def ensure_tx():
@@ -786,6 +893,21 @@ def gcs_heartbeat_thread(stop_evt):
                                           mavutil.mavlink.MAV_AUTOPILOT_INVALID,
                                           0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
                     _last_hb = time.time()
+        except Exception:
+            pass
+        stop_evt.wait(HEARTBEAT_MS / 1000.0)
+
+
+def parent_gcs_heartbeat_thread(stop_evt):
+    while not stop_evt.is_set():
+        try:
+            with _parent_tx_lock:
+                if parent_tx:
+                    parent_tx.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_GCS,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        0, 0, mavutil.mavlink.MAV_STATE_ACTIVE
+                    )
         except Exception:
             pass
         stop_evt.wait(HEARTBEAT_MS / 1000.0)
@@ -892,12 +1014,21 @@ def wait_alt(min_alt_m=CONFIRM_ALT_M, timeout_s=30):
 
 # ---------------------- Crash handling & restart ---------------------------
 def handle_px4_failure_and_restart():
-    global vehicle_ready
+    global vehicle_ready, parent_tx
     log("[restart] px4 failure detected; restarting")
     try:
+        with _parent_tx_lock:
+            try:
+                if parent_tx:
+                    parent_tx.close()
+            except Exception:
+                pass
+            parent_tx = None
+            parent_tx = None
         kill_existing_px4()
         kill_gazebo()
         start_px4()
+        connect_parent_tx()
         vehicle_ready = True
     except Exception as e:
         log(f"[restart] error: {e}")
@@ -925,18 +1056,14 @@ def generate_random_case(rng):
     return bytes(rng.getrandbits(8) for _ in range(size))
 
 
-def run_single_mission_iteration(buf, base_items):
+def run_single_mission_iteration(buf, base_items, iteration):
     global tx
 
     if not connect_tx():
         raise RuntimeError("Unable to connect to PX4 MAVLink endpoint")
 
-    hb_stop = threading.Event()
-    hb_t = threading.Thread(target=gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
-    hb_t.start()
-
     try:
-        log("[run_single_mission_iteration] sending heartbeats for 2s before mission upload")
+        log("[run_single_mission_iteration] parent heartbeat active; waiting 2s before mission upload")
         t0 = time.time()
         while time.time() - t0 < 2.0:
             try:
@@ -946,25 +1073,43 @@ def run_single_mission_iteration(buf, base_items):
                 pass
             time.sleep(0.05)
 
-        px4_alive_or_die(buf)
+        px4_alive_or_die(buf, meta={"iteration": iteration})
 
         if (buf[0] & 0x7) == 0:
             clear_mission(tx)
 
-        items = mutate_mission_from_bytes(buf, base_items, want_len=10)
+        items = mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=iteration)
+        min_len, max_len = mission_length_window(iteration)
+        case_meta = {
+            "iteration": iteration,
+            "mission_len": len(items),
+            "mission_min_len": min_len,
+            "mission_max_len": max_len,
+        }
         res = upload_mission_safe(tx, items)
-        save_last_case(buf, why=f"mission_ack_{res}")
+        save_last_case(buf, why=f"mission_ack_{res}", mission_items=items, meta=case_meta)
 
         time.sleep(POST_SEND_MS / 1000.0)
-        px4_alive_or_die(buf)
+        px4_alive_or_die(buf, mission_items=items, meta=case_meta)
         return 0
     except Exception as e:
         log(f"[run_single_mission_iteration] exception: {e}")
-        save_last_case(buf, why="exception")
+        items = mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=iteration)
+        min_len, max_len = mission_length_window(iteration)
+        save_last_case(
+            buf,
+            why="exception",
+            mission_items=items,
+            meta={
+                "iteration": iteration,
+                "mission_len": len(items),
+                "mission_min_len": min_len,
+                "mission_max_len": max_len,
+                "exception": str(e),
+            },
+        )
         return 2
     finally:
-        hb_stop.set()
-        hb_t.join(timeout=1.0)
         with _tx_lock:
             try:
                 if tx:
@@ -975,35 +1120,67 @@ def run_single_mission_iteration(buf, base_items):
 
 
 def missionLoop():
+    global parent_tx
     rng = make_case_generator()
     base_items = build_mission_items()
+    hb_stop = threading.Event()
+    hb_t = None
 
     log(f"[missionLoop] starting Python fork loop for {FORKSERVER_ITERATIONS} iterations")
     wait_for_px4_settle("forkserver bootstrap")
+    if not connect_parent_tx():
+        raise RuntimeError("Unable to establish parent heartbeat channel to PX4")
 
-    for iteration in range(FORKSERVER_ITERATIONS):
-        buf = generate_random_case(rng)
-        pid = os.fork()
+    hb_t = threading.Thread(target=parent_gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
+    hb_t.start()
 
-        if pid == 0:
-            exit_code = run_single_mission_iteration(buf or b"\x00", base_items)
-            os._exit(exit_code)
+    try:
+        for iteration in range(FORKSERVER_ITERATIONS):
+            buf = generate_random_case(rng)
+            pid = os.fork()
 
-        child_pid, status = os.waitpid(pid, 0)
-        log(f"[missionLoop] child {child_pid} finished with status {status}")
+            if pid == 0:
+                exit_code = run_single_mission_iteration(buf or b"\x00", base_items, iteration)
+                os._exit(exit_code)
 
-        if os.WIFSIGNALED(status):
-            log(f"[missionLoop] child killed by signal {os.WTERMSIG(status)}; restarting PX4")
-            save_last_case(buf, why="child_signal")
+            child_pid, status = os.waitpid(pid, 0)
+            log(f"[missionLoop] child {child_pid} finished with status {status}")
+
+            if os.WIFSIGNALED(status):
+                log(f"[missionLoop] child killed by signal {os.WTERMSIG(status)}; restarting PX4")
+                items = mutate_mission_from_bytes(buf or b"\x00", base_items, want_len=10, iteration=iteration)
+                min_len, max_len = mission_length_window(iteration)
+                save_last_case(
+                    buf,
+                    why="child_signal",
+                    mission_items=items,
+                    meta={
+                        "iteration": iteration,
+                        "signal": os.WTERMSIG(status),
+                        "mission_len": len(items),
+                        "mission_min_len": min_len,
+                        "mission_max_len": max_len,
+                    },
+                )
+                handle_px4_failure_and_restart()
+                continue
+
+            exit_code = os.WEXITSTATUS(status)
+            if exit_code == 0:
+                continue
+
+            log(f"[missionLoop] iteration {iteration} returned exit code {exit_code}; restarting PX4")
             handle_px4_failure_and_restart()
-            continue
-
-        exit_code = os.WEXITSTATUS(status)
-        if exit_code == 0:
-            continue
-
-        log(f"[missionLoop] iteration {iteration} returned exit code {exit_code}; restarting PX4")
-        handle_px4_failure_and_restart()
+    finally:
+        hb_stop.set()
+        if hb_t:
+            hb_t.join(timeout=1.0)
+        with _parent_tx_lock:
+            try:
+                if parent_tx:
+                    parent_tx.close()
+            except Exception:
+                pass
 
 # --------------------------- Send UDP Messages ---------------------------
 
