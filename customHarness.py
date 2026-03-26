@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 combined_fuzz_lifeline.py
@@ -57,7 +56,7 @@ PX4_PID_GREP_LIST = [
     "/usr/bin/cmake -E env PX4_SIM_MODEL=gz_x500",
     "/build/px4_sitl_default/bin/px4"
 ]
-PID_FILE = os.getenv("PID_FILE", "/tmp/px4_pids.json")
+PID_FILE = os.getenv("PID_FILE", "findings/px4_pids.json")
 HEARTBEAT_MS = int(os.getenv("HEARTBEAT_MS", "500"))    # keepalive heartbeat interval (ms)
 SETPOINT_HZ = int(os.getenv("SETPOINT_HZ", "20"))      # setpoint stream rate
 TARGET_X = float(os.getenv("TARGET_X", "0"))
@@ -67,9 +66,9 @@ CONFIRM_ALT_M = float(os.getenv("CONFIRM_ALT_M", "2.0"))
 POST_SEND_MS = int(os.getenv("POST_SEND_MS", "30"))    # dwell after send to let crash manifest
 MAX_INPUT = int(os.getenv("MAX_INPUT", "8192"))        # max bytes generated per testcase
 MIN_INPUT = int(os.getenv("MIN_INPUT", "1"))
-PX4_STARTUP_WAIT_S = float(os.getenv("PX4_STARTUP_WAIT_S", "65"))
-LOGFILE          = os.getenv("HARNESS_LOG", "/tmp/combined_fuzz.log")
-RESTART_LOCK     = os.getenv("PX4_RESTART_LOCK", "/tmp/px4_restart.lock")
+PX4_STARTUP_WAIT_S = float(os.getenv("PX4_STARTUP_WAIT_S", "30"))
+LOGFILE          = os.getenv("HARNESS_LOG", "findings/combined_fuzz.log")
+RESTART_LOCK     = os.getenv("PX4_RESTART_LOCK", "findings/px4_restart.lock")
 
 GCS_SYSTEM_ID    = int(os.getenv("GCS_SYSTEM_ID", "250"))
 GCS_COMPONENT_ID = int(os.getenv(
@@ -93,10 +92,13 @@ MISSION_UPLOAD_TIMEOUT_S = float(os.getenv("MISSION_UPLOAD_TIMEOUT_S", "8.0"))
 CLEAR_MISSION_TIMEOUT_S = float(os.getenv("CLEAR_MISSION_TIMEOUT_S", "5.0"))
 PRE_SEND_WARMUP_S = float(os.getenv("PRE_SEND_WARMUP_S", "2.0"))
 RECENT_HISTORY_LIMIT = int(os.getenv("RECENT_HISTORY_LIMIT", "20"))
+FIRST_MISSION_DUMP_LIMIT = int(os.getenv("FIRST_MISSION_DUMP_LIMIT", "20"))
+FIRST_MISSION_DUMP_FILE = os.getenv("FIRST_MISSION_DUMP_FILE", "findings/first_20_missions.txt")
 INITIAL_STARTUP_WAIT = False
 
 vehicle_ready = False
 recent_missions = deque(maxlen=RECENT_HISTORY_LIMIT)
+first_mission_dump_count = 0
 
 # Upload Mission Fuzzing
 #---------------------------------------------------------------------
@@ -325,6 +327,45 @@ def _serialize_mission_items(items):
     for item in items:
         serialized.append({key: _json_safe_value(value) for key, value in item.items()})
     return serialized
+
+
+def format_mission_for_text(items, meta=None):
+    lines = []
+    if meta:
+        lines.append(
+            "meta: " + ", ".join(f"{key}={value}" for key, value in sorted(meta.items()))
+        )
+    for item in _serialize_mission_items(items):
+        lines.append(
+            "seq={seq} cmd={command} frame={frame} x={x} y={y} z={z} "
+            "p1={param1} p2={param2} p3={param3} p4={param4}".format(**item)
+        )
+    return "\n".join(lines)
+
+
+def init_first_mission_dump():
+    global first_mission_dump_count
+    first_mission_dump_count = 0
+    dump_path = Path(FIRST_MISSION_DUMP_FILE)
+    dump_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_path.write_text("", encoding="utf-8")
+
+
+def maybe_dump_mission_preview(buf, items, meta):
+    global first_mission_dump_count
+    if first_mission_dump_count >= max(0, FIRST_MISSION_DUMP_LIMIT):
+        return
+
+    first_mission_dump_count += 1
+    sha1 = hashlib.sha1(buf).hexdigest()
+    block = [
+        f"mission_index={first_mission_dump_count}",
+        f"sha1={sha1}",
+        format_mission_for_text(items, meta),
+        "",
+    ]
+    with open(FIRST_MISSION_DUMP_FILE, "a", encoding="utf-8") as f:
+        f.write("\n".join(block))
 
 
 def record_recent_mission(buf, items, meta):
@@ -644,6 +685,8 @@ def build_arg_parser():
     parser.add_argument("--mission-upload-timeout-s", type=float, default=MISSION_UPLOAD_TIMEOUT_S)
     parser.add_argument("--clear-mission-timeout-s", type=float, default=CLEAR_MISSION_TIMEOUT_S)
     parser.add_argument("--recent-history-limit", type=int, default=RECENT_HISTORY_LIMIT)
+    parser.add_argument("--first-mission-dump-limit", type=int, default=FIRST_MISSION_DUMP_LIMIT)
+    parser.add_argument("--first-mission-dump-file", default=FIRST_MISSION_DUMP_FILE)
     parser.add_argument(
         "--initial-startup-wait",
         action=argparse.BooleanOptionalAction,
@@ -662,7 +705,7 @@ def apply_runtime_config(args):
     global MISSION_MAX_LEN_CAP, MISSION_LEN_GROWTH_STEP, MISSION_LEN_GROWTH_EVERY
     global REPORT_SNAPSHOT_INTERVAL_S, MAVLINK_RECV_TIMEOUT_S, MISSION_REQUEST_POLL_TIMEOUT_S
     global MISSION_UPLOAD_TIMEOUT_S, CLEAR_MISSION_TIMEOUT_S, RECENT_HISTORY_LIMIT, recent_missions
-    global INITIAL_STARTUP_WAIT
+    global FIRST_MISSION_DUMP_LIMIT, FIRST_MISSION_DUMP_FILE, INITIAL_STARTUP_WAIT
 
     MAVLINK_HOST = args.mavlink_host
     MAVLINK_PORT = args.mavlink_port
@@ -699,6 +742,8 @@ def apply_runtime_config(args):
     MISSION_UPLOAD_TIMEOUT_S = args.mission_upload_timeout_s
     CLEAR_MISSION_TIMEOUT_S = args.clear_mission_timeout_s
     RECENT_HISTORY_LIMIT = args.recent_history_limit
+    FIRST_MISSION_DUMP_LIMIT = args.first_mission_dump_limit
+    FIRST_MISSION_DUMP_FILE = args.first_mission_dump_file
     INITIAL_STARTUP_WAIT = args.initial_startup_wait
     recent_missions = deque(maxlen=max(1, RECENT_HISTORY_LIMIT))
 
@@ -1247,14 +1292,14 @@ def run_single_mission_iteration(buf, items, case_meta):
 
     try:
         log("[run_single_mission_iteration] parent heartbeat active; waiting before mission upload")
-        t0 = time.time()
-        while time.time() - t0 < PRE_SEND_WARMUP_S:
-            try:
-                if tx:
-                    tx.recv_match(blocking=False)
-            except Exception:
-                pass
-            time.sleep(0.05)
+        #t0 = time.time()
+        #while time.time() - t0 < PRE_SEND_WARMUP_S:
+        #    try:
+        #        if tx:
+        #            tx.recv_match(blocking=False)
+        #    except Exception:
+        #        pass
+        #    time.sleep(0.05)
 
         px4_alive_or_die(buf, mission_items=items, meta=case_meta)
 
@@ -1303,8 +1348,12 @@ def missionLoop():
     hb_t = threading.Thread(target=parent_gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
     hb_t.start()
 
+    iteration = 0
     try:
-        for iteration in range(FORKSERVER_ITERATIONS):
+        while True: 
+            iteration += 1
+        
+        #for iteration in range(FORKSERVER_ITERATIONS):
             buf = generate_random_case(rng)
             items = mutate_mission_from_bytes(buf or b"\x00", base_items, want_len=10, iteration=iteration)
             min_len, max_len = mission_length_window(iteration)
@@ -1315,6 +1364,7 @@ def missionLoop():
                 "mission_max_len": max_len,
             }
             record_recent_mission(buf, items, case_meta)
+            maybe_dump_mission_preview(buf, items, case_meta)
             pid = os.fork()
 
             if pid == 0:
@@ -1404,6 +1454,7 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     apply_runtime_config(args)
     configure_logging()
+    init_first_mission_dump()
 
     log("[main] checking PX4 state...")
     ensure_px4_running()
