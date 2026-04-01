@@ -26,6 +26,7 @@ import socket
 import select
 import pdb
 import struct
+import traceback
 from pathlib import Path
 import textwrap
 import hashlib
@@ -63,7 +64,8 @@ TARGET_X = float(os.getenv("TARGET_X", "0"))
 TARGET_Y = float(os.getenv("TARGET_Y", "0"))
 TARGET_Z = float(os.getenv("TARGET_Z", "-5.0"))        # LOCAL_NED negative = up
 CONFIRM_ALT_M = float(os.getenv("CONFIRM_ALT_M", "2.0"))
-POST_SEND_MS = int(os.getenv("POST_SEND_MS", "30"))    # dwell after send to let crash manifest
+POST_SEND_MS = int(os.getenv("POST_SEND_MS", "3"))    # dwell after send to let crash manifest
+MISSION_RATE_HZ = float(os.getenv("MISSION_RATE_HZ", "0"))  # 0 = no rate limit
 MAX_INPUT = int(os.getenv("MAX_INPUT", "8192"))        # max bytes generated per testcase
 MIN_INPUT = int(os.getenv("MIN_INPUT", "1"))
 PX4_STARTUP_WAIT_S = float(os.getenv("PX4_STARTUP_WAIT_S", "30"))
@@ -78,11 +80,11 @@ GCS_COMPONENT_ID = int(os.getenv(
 
 UNSUPPORTED_COMMAND_ID = int(os.getenv("UNSUPPORTED_COMMAND_ID", "5000"))
 
-FORKSERVER_ITERATIONS = int(os.getenv("FORKSERVER_ITERATIONS", "1000"))
+FORKSERVER_ITERATIONS = int(os.getenv("FORKSERVER_ITERATIONS", "0"))
 HARNESS_SEED = os.getenv("HARNESS_SEED")
 MISSION_MIN_LEN = int(os.getenv("MISSION_MIN_LEN", "10"))
 MISSION_START_MAX_LEN = int(os.getenv("MISSION_START_MAX_LEN", "30"))
-MISSION_MAX_LEN_CAP = int(os.getenv("MISSION_MAX_LEN_CAP", "1000"))
+MISSION_MAX_LEN_CAP = int(os.getenv("MISSION_MAX_LEN_CAP", "50"))
 MISSION_LEN_GROWTH_STEP = int(os.getenv("MISSION_LEN_GROWTH_STEP", "5"))
 MISSION_LEN_GROWTH_EVERY = int(os.getenv("MISSION_LEN_GROWTH_EVERY", "250"))
 REPORT_SNAPSHOT_INTERVAL_S = int(os.getenv("REPORT_SNAPSHOT_INTERVAL_S", str(4 * 60 * 60)))
@@ -91,6 +93,7 @@ MISSION_REQUEST_POLL_TIMEOUT_S = float(os.getenv("MISSION_REQUEST_POLL_TIMEOUT_S
 MISSION_UPLOAD_TIMEOUT_S = float(os.getenv("MISSION_UPLOAD_TIMEOUT_S", "8.0"))
 CLEAR_MISSION_TIMEOUT_S = float(os.getenv("CLEAR_MISSION_TIMEOUT_S", "5.0"))
 PRE_SEND_WARMUP_S = float(os.getenv("PRE_SEND_WARMUP_S", "2.0"))
+RECONNECT_RETRY_DELAY_S = float(os.getenv("RECONNECT_RETRY_DELAY_S", "2.0"))
 RECENT_HISTORY_LIMIT = int(os.getenv("RECENT_HISTORY_LIMIT", "20"))
 FIRST_MISSION_DUMP_LIMIT = int(os.getenv("FIRST_MISSION_DUMP_LIMIT", "20"))
 FIRST_MISSION_DUMP_FILE = os.getenv("FIRST_MISSION_DUMP_FILE", "findings/first_20_missions.txt")
@@ -99,6 +102,10 @@ INITIAL_STARTUP_WAIT = False
 vehicle_ready = False
 recent_missions = deque(maxlen=RECENT_HISTORY_LIMIT)
 first_mission_dump_count = 0
+
+
+class PX4DiedError(RuntimeError):
+    """Raised when the monitored PX4 process disappears during fuzzing."""
 
 # Upload Mission Fuzzing
 #---------------------------------------------------------------------
@@ -180,6 +187,10 @@ def _pick_from(buf, off, n, default=0):
     return bytes([default]) * n
 
 
+def _first_byte(buf, default=0):
+    return buf[0] if buf else default
+
+
 def mission_length_window(iteration: int):
     min_len = max(1, MISSION_MIN_LEN)
     start_max = max(min_len, MISSION_START_MAX_LEN)
@@ -203,7 +214,7 @@ def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
     # Grow the allowable mission length as the fuzz run progresses.
     if len(buf) >= 1:
         span = max_len - min_len + 1
-        L = min_len + (buf[0] % span)
+        L = min_len + (_first_byte(buf) % span)
     else:
         L = min(max_len, max(min_len, want_len))
 
@@ -287,17 +298,17 @@ def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
         it["param1"] = 0.0
         it["param2"] = 0.0
         it["param3"] = 0.0
-        it["param4"] = float("nan")
+        it["param4"] = 0.0
 
         if it["command"] == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
             it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 0.0, 15.0, 0.0)
             it["param2"] = bounded_float(_pick_from(chunk, 10, 4, 0), 0.5, 25.0, 2.0)
             it["param3"] = bounded_float(_pick_from(chunk, 14, 4, 0), 0.0, 10.0, 0.0)
             yaw = bounded_float(_pick_from(chunk, 16, 4, 0), -180.0, 180.0, 0.0)
-            it["param4"] = yaw if len(chunk) >= 18 and (chunk[18] & 0x1) else float("nan")
+            it["param4"] = yaw if len(chunk) >= 18 and (chunk[18] & 0x1) else 0.0
         elif it["command"] == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
             it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 0.0, 10.0, 0.0)
-            it["param4"] = float("nan")
+            it["param4"] = 0.0
             it["z"] = bounded_float(_pick_from(chunk, 10, 4, 0), 10.0, 80.0, 20.0)
         elif it["command"] == mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME:
             it["param1"] = bounded_float(_pick_from(chunk, 6, 4, 0), 1.0, 120.0, 10.0)
@@ -461,7 +472,7 @@ def save_last_case(buf, why="case", out_dir="/tmp/mission_fuzz_cases", mission_i
 
 def px4_alive_or_die(current_input: bytes, mission_items=None, meta=None):
     """
-    If PX4 dies, force this python process to exit nonzero so the parent can record it.
+    Detect when PX4 has died so the main loop can restart it cleanly.
     """
     pids = read_px4_pids()
     if not pids:
@@ -469,7 +480,7 @@ def px4_alive_or_die(current_input: bytes, mission_items=None, meta=None):
     alive = all(is_pid_alive_not_zombie(p) for p in pids)
     if not alive:
         save_last_case(current_input, why="px4_died", mission_items=mission_items, meta=meta)
-        os._exit(1)
+        raise PX4DiedError("PX4 process died during mission iteration")
 
 def wait_heartbeat(m):
     hb = m.wait_heartbeat(timeout=10)
@@ -518,7 +529,7 @@ def build_mission_items():
         command=mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
         current=1,
         autocontinue=1,
-        param1=0, param2=0, param3=0, param4=float("nan"),
+        param1=0, param2=0, param3=0, param4=0.0,
         x=lat, y=lon, z=alt
     ))
 
@@ -529,7 +540,7 @@ def build_mission_items():
         command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
         current=0,
         autocontinue=1,
-        param1=0, param2=2, param3=0, param4=float("nan"),
+        param1=0, param2=2, param3=0, param4=0.0,
         x=lat + int(0.0000100 * 1e7),  # ~1e-5 deg
         y=lon,
         z=alt
@@ -542,7 +553,7 @@ def build_mission_items():
         command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
         current=0,
         autocontinue=1,
-        param1=0, param2=2, param3=0, param4=float("nan"),
+        param1=0, param2=2, param3=0, param4=0.0,
         x=lat + int(0.0000100 * 1e7),
         y=lon + int(0.0000100 * 1e7),
         z=alt
@@ -555,7 +566,7 @@ def build_mission_items():
         command=mavutil.mavlink.MAV_CMD_NAV_LAND,
         current=0,
         autocontinue=1,
-        param1=0, param2=0, param3=0, param4=float("nan"),
+        param1=0, param2=0, param3=0, param4=0.0,
         x=lat,
         y=lon,
         z=0.0
@@ -663,6 +674,12 @@ def build_arg_parser():
     parser.add_argument("--target-z", type=float, default=TARGET_Z)
     parser.add_argument("--confirm-alt-m", type=float, default=CONFIRM_ALT_M)
     parser.add_argument("--post-send-ms", type=int, default=POST_SEND_MS)
+    parser.add_argument(
+        "--mission-rate-hz",
+        type=float,
+        default=MISSION_RATE_HZ,
+        help="Mission sends per second. Use 0 for no artificial rate limit.",
+    )
     parser.add_argument("--pre-send-warmup-s", type=float, default=PRE_SEND_WARMUP_S)
     parser.add_argument("--max-input", type=int, default=MAX_INPUT)
     parser.add_argument("--min-input", type=int, default=MIN_INPUT)
@@ -672,7 +689,12 @@ def build_arg_parser():
     parser.add_argument("--gcs-system-id", type=int, default=GCS_SYSTEM_ID)
     parser.add_argument("--gcs-component-id", type=int, default=GCS_COMPONENT_ID)
     parser.add_argument("--unsupported-command-id", type=int, default=UNSUPPORTED_COMMAND_ID)
-    parser.add_argument("--iterations", type=int, default=FORKSERVER_ITERATIONS)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=FORKSERVER_ITERATIONS,
+        help="Number of missions to send. Use 0 for an infinite run.",
+    )
     parser.add_argument("--seed", default=HARNESS_SEED)
     parser.add_argument("--mission-min-len", type=int, default=MISSION_MIN_LEN)
     parser.add_argument("--mission-start-max-len", type=int, default=MISSION_START_MAX_LEN)
@@ -684,6 +706,12 @@ def build_arg_parser():
     parser.add_argument("--mission-request-poll-timeout-s", type=float, default=MISSION_REQUEST_POLL_TIMEOUT_S)
     parser.add_argument("--mission-upload-timeout-s", type=float, default=MISSION_UPLOAD_TIMEOUT_S)
     parser.add_argument("--clear-mission-timeout-s", type=float, default=CLEAR_MISSION_TIMEOUT_S)
+    parser.add_argument(
+        "--reconnect-retry-delay-s",
+        type=float,
+        default=RECONNECT_RETRY_DELAY_S,
+        help="Delay between repeated reconnect attempts after a send or PX4 failure.",
+    )
     parser.add_argument("--recent-history-limit", type=int, default=RECENT_HISTORY_LIMIT)
     parser.add_argument("--first-mission-dump-limit", type=int, default=FIRST_MISSION_DUMP_LIMIT)
     parser.add_argument("--first-mission-dump-file", default=FIRST_MISSION_DUMP_FILE)
@@ -699,12 +727,13 @@ def build_arg_parser():
 def apply_runtime_config(args):
     global MAVLINK_HOST, MAVLINK_PORT, START_CMD, PX4_DIR, PX4_BIN_MATCH, PID_FILE
     global HEARTBEAT_MS, SETPOINT_HZ, TARGET_X, TARGET_Y, TARGET_Z, CONFIRM_ALT_M
-    global POST_SEND_MS, PRE_SEND_WARMUP_S, MAX_INPUT, MIN_INPUT, PX4_STARTUP_WAIT_S
+    global POST_SEND_MS, MISSION_RATE_HZ, PRE_SEND_WARMUP_S, MAX_INPUT, MIN_INPUT, PX4_STARTUP_WAIT_S
     global LOGFILE, RESTART_LOCK, GCS_SYSTEM_ID, GCS_COMPONENT_ID, UNSUPPORTED_COMMAND_ID
     global FORKSERVER_ITERATIONS, HARNESS_SEED, MISSION_MIN_LEN, MISSION_START_MAX_LEN
     global MISSION_MAX_LEN_CAP, MISSION_LEN_GROWTH_STEP, MISSION_LEN_GROWTH_EVERY
     global REPORT_SNAPSHOT_INTERVAL_S, MAVLINK_RECV_TIMEOUT_S, MISSION_REQUEST_POLL_TIMEOUT_S
-    global MISSION_UPLOAD_TIMEOUT_S, CLEAR_MISSION_TIMEOUT_S, RECENT_HISTORY_LIMIT, recent_missions
+    global MISSION_UPLOAD_TIMEOUT_S, CLEAR_MISSION_TIMEOUT_S, RECONNECT_RETRY_DELAY_S
+    global RECENT_HISTORY_LIMIT, recent_missions
     global FIRST_MISSION_DUMP_LIMIT, FIRST_MISSION_DUMP_FILE, INITIAL_STARTUP_WAIT
 
     MAVLINK_HOST = args.mavlink_host
@@ -719,7 +748,8 @@ def apply_runtime_config(args):
     TARGET_Y = args.target_y
     TARGET_Z = args.target_z
     CONFIRM_ALT_M = args.confirm_alt_m
-    POST_SEND_MS = args.post_send_ms
+    POST_SEND_MS = max(0, args.post_send_ms)
+    MISSION_RATE_HZ = max(0.0, args.mission_rate_hz)
     PRE_SEND_WARMUP_S = args.pre_send_warmup_s
     MAX_INPUT = args.max_input
     MIN_INPUT = args.min_input
@@ -741,6 +771,7 @@ def apply_runtime_config(args):
     MISSION_REQUEST_POLL_TIMEOUT_S = args.mission_request_poll_timeout_s
     MISSION_UPLOAD_TIMEOUT_S = args.mission_upload_timeout_s
     CLEAR_MISSION_TIMEOUT_S = args.clear_mission_timeout_s
+    RECONNECT_RETRY_DELAY_S = max(0.1, args.reconnect_retry_delay_s)
     RECENT_HISTORY_LIMIT = args.recent_history_limit
     FIRST_MISSION_DUMP_LIMIT = args.first_mission_dump_limit
     FIRST_MISSION_DUMP_FILE = args.first_mission_dump_file
@@ -1057,6 +1088,12 @@ def connect_tx(timeout=20):
     global tx, _last_hb
     with _tx_lock:
         try:
+            if tx is not None:
+                try:
+                    tx.close()
+                except Exception:
+                    pass
+                tx = None
             # use udpout so we actively send to PX4 and avoid binding conflicts
             conn_str = f"udp:{MAVLINK_HOST}:{MAVLINK_PORT}"
             tx = mavutil.mavlink_connection(conn_str, source_system=250)
@@ -1071,6 +1108,17 @@ def connect_tx(timeout=20):
             log(f"[connect_tx] failed: {e}")
             tx = None
             return False
+
+
+def close_tx():
+    global tx
+    with _tx_lock:
+        try:
+            if tx:
+                tx.close()
+        except Exception:
+            pass
+        tx = None
 
 
 def connect_parent_tx(timeout=20):
@@ -1262,6 +1310,28 @@ def handle_px4_failure_and_restart():
         log(f"[restart] error: {e}")
         vehicle_ready = False
 
+
+def ensure_channels_ready():
+    """Keep retrying until both the parent heartbeat and mission channels are live."""
+    while True:
+        parent_ready = True
+        with _parent_tx_lock:
+            parent_ready = parent_tx is not None
+
+        if not parent_ready:
+            log("[ensure_channels_ready] parent heartbeat channel missing; reconnecting")
+            if not connect_parent_tx():
+                time.sleep(RECONNECT_RETRY_DELAY_S)
+                continue
+
+        if ensure_tx():
+            return True
+
+        log("[ensure_channels_ready] mission channel unavailable; restarting PX4 and retrying")
+        close_tx()
+        handle_px4_failure_and_restart()
+        time.sleep(RECONNECT_RETRY_DELAY_S)
+
 # ---------------------- Python forkserver harness loop ---------------------
 def make_case_generator():
     rng = random.Random()
@@ -1285,31 +1355,21 @@ def generate_random_case(rng):
 
 
 def run_single_mission_iteration(buf, items, case_meta):
-    global tx
-
-    if not connect_tx():
-        raise RuntimeError("Unable to connect to PX4 MAVLink endpoint")
+    if not ensure_tx():
+        log("[run_single_mission_iteration] mission channel unavailable; will retry")
+        return 2
 
     try:
-        log("[run_single_mission_iteration] parent heartbeat active; waiting before mission upload")
-        #t0 = time.time()
-        #while time.time() - t0 < PRE_SEND_WARMUP_S:
-        #    try:
-        #        if tx:
-        #            tx.recv_match(blocking=False)
-        #    except Exception:
-        #        pass
-        #    time.sleep(0.05)
-
         px4_alive_or_die(buf, mission_items=items, meta=case_meta)
 
-        if (buf[0] & 0x7) == 0:
+        if (_first_byte(buf) & 0x7) == 0:
             clear_mission(tx)
 
         res = upload_mission_safe(tx, items)
         save_last_case(buf, why=f"mission_ack_{res}", mission_items=items, meta=case_meta)
 
-        time.sleep(POST_SEND_MS / 1000.0)
+        if POST_SEND_MS > 0:
+            time.sleep(POST_SEND_MS / 1000.0)
         px4_alive_or_die(buf, mission_items=items, meta=case_meta)
         return 0
     except Exception as e:
@@ -1320,15 +1380,8 @@ def run_single_mission_iteration(buf, items, case_meta):
             mission_items=items,
             meta={**case_meta, "exception": str(e)},
         )
+        close_tx()
         return 2
-    finally:
-        with _tx_lock:
-            try:
-                if tx:
-                    tx.close()
-            except Exception:
-                pass
-            tx = None
 
 
 def missionLoop():
@@ -1338,69 +1391,72 @@ def missionLoop():
     hb_stop = threading.Event()
     hb_t = None
     missions_sent = 0
+    next_send_deadline = time.monotonic()
 
-    log(f"[missionLoop] starting Python fork loop for {FORKSERVER_ITERATIONS} iterations")
+    iteration_target = "infinite" if FORKSERVER_ITERATIONS <= 0 else str(FORKSERVER_ITERATIONS)
+    log(f"[missionLoop] starting mission loop for {iteration_target} iterations")
     if INITIAL_STARTUP_WAIT:
         wait_for_px4_settle("forkserver bootstrap")
-    if not connect_parent_tx():
-        raise RuntimeError("Unable to establish parent heartbeat channel to PX4")
+    ensure_channels_ready()
 
     hb_t = threading.Thread(target=parent_gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
     hb_t.start()
 
     iteration = 0
     try:
-        while True: 
+        while FORKSERVER_ITERATIONS <= 0 or iteration < FORKSERVER_ITERATIONS:
             iteration += 1
-        
-        #for iteration in range(FORKSERVER_ITERATIONS):
-            buf = generate_random_case(rng)
-            items = mutate_mission_from_bytes(buf or b"\x00", base_items, want_len=10, iteration=iteration)
-            min_len, max_len = mission_length_window(iteration)
-            case_meta = {
-                "iteration": iteration,
-                "mission_len": len(items),
-                "mission_min_len": min_len,
-                "mission_max_len": max_len,
-            }
-            record_recent_mission(buf, items, case_meta)
-            maybe_dump_mission_preview(buf, items, case_meta)
-            pid = os.fork()
+            buf = b"\x00"
+            items = []
+            case_meta = {"iteration": iteration}
+            try:
+                if MISSION_RATE_HZ > 0:
+                    now = time.monotonic()
+                    if next_send_deadline > now:
+                        time.sleep(next_send_deadline - now)
+                    next_send_deadline = max(next_send_deadline, time.monotonic()) + (1.0 / MISSION_RATE_HZ)
 
-            if pid == 0:
-                exit_code = run_single_mission_iteration(buf or b"\x00", items, case_meta)
-                os._exit(exit_code)
+                buf = generate_random_case(rng) or b"\x00"
+                items = mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=iteration)
+                min_len, max_len = mission_length_window(iteration)
+                case_meta = {
+                    "iteration": iteration,
+                    "mission_len": len(items),
+                    "mission_min_len": min_len,
+                    "mission_max_len": max_len,
+                }
+                record_recent_mission(buf, items, case_meta)
+                maybe_dump_mission_preview(buf, items, case_meta)
+                exit_code = run_single_mission_iteration(buf, items, case_meta)
+                missions_sent += 1
+                print(f"\rMissions sent: {missions_sent}", end="", flush=True)
 
-            child_pid, status = os.waitpid(pid, 0)
-            log(f"[missionLoop] child {child_pid} finished with status {status}")
-            missions_sent += 1
-            print(f"\rMissions sent: {missions_sent}", end="", flush=True)
+                if exit_code == 0:
+                    continue
 
-            if os.WIFSIGNALED(status):
-                log(f"[missionLoop] child killed by signal {os.WTERMSIG(status)}; restarting PX4")
+                log(f"[missionLoop] iteration {iteration} returned exit code {exit_code}; restarting PX4")
+                dump_recent_history("child_exit", trigger_meta={**case_meta, "exit_code": exit_code})
+            except Exception as e:
+                log(f"[missionLoop] iteration {iteration} unexpected error: {e}")
+                log(traceback.format_exc().rstrip())
                 save_last_case(
                     buf,
-                    why="child_signal",
+                    why="exception",
                     mission_items=items,
-                    meta={**case_meta, "signal": os.WTERMSIG(status)},
+                    meta={**case_meta, "exception": str(e), "phase": "missionLoop"},
                 )
-                dump_recent_history("child_signal", trigger_meta={**case_meta, "signal": os.WTERMSIG(status)})
-                handle_px4_failure_and_restart()
-                continue
+                dump_recent_history("iteration_exception", trigger_meta={**case_meta, "exception": str(e)})
 
-            exit_code = os.WEXITSTATUS(status)
-            if exit_code == 0:
-                continue
-
-            log(f"[missionLoop] iteration {iteration} returned exit code {exit_code}; restarting PX4")
-            dump_recent_history("child_exit", trigger_meta={**case_meta, "exit_code": exit_code})
-            handle_px4_failure_and_restart()
+            close_tx()
+            ensure_channels_ready()
+            next_send_deadline = time.monotonic()
     finally:
         if missions_sent:
             print()
         hb_stop.set()
         if hb_t:
             hb_t.join(timeout=1.0)
+        close_tx()
         with _parent_tx_lock:
             try:
                 if parent_tx:
