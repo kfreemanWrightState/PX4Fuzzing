@@ -4,6 +4,8 @@ This branch uses `customHarness.py`, a standalone PX4 mission fuzzer for SITL.
 It no longer relies on `python-afl`, `py-afl-fuzz`, stdin-driven testcases, or
 the `make_seeds.py` workflow.
 
+This setup pins PX4 to release `v1.16.1`.
+
 Instead, the harness:
 
 - keeps long-lived MAVLink connections open
@@ -49,7 +51,7 @@ This project uses:
 - `pymavlink`
 - clang and lld
 - Git
-- PX4-Autopilot source code
+- PX4-Autopilot source code at `v1.16.1`
 - Gazebo
 - QGroundControl, optional
 
@@ -126,7 +128,10 @@ git checkout customFuzzer
 Clone PX4:
 
 ```bash
-git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+git clone --branch v1.16.1 https://github.com/PX4/PX4-Autopilot.git
+cd PX4-Autopilot
+git submodule update --init --recursive
+cd ..
 ```
 
 Optional QGroundControl source:

@@ -6,6 +6,8 @@ set -euo pipefail
 # Ubuntu 24.04 LTS
 #############################################
 
+PX4_VERSION="v1.16.1"
+
 echo "=============================================="
 echo " PX4 Mission Fuzzing Environment Setup"
 echo "=============================================="
@@ -108,10 +110,14 @@ echo "[STEP 3] Cloning repositories"
 
 
 if [[ ! -d PX4-Autopilot ]]; then
-  git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+  git clone --branch "$PX4_VERSION" https://github.com/PX4/PX4-Autopilot.git
 else
-  echo "PX4-Autopilot already exists, skipping clone"
+  echo "PX4-Autopilot already exists, reusing repository"
 fi
+
+git -C PX4-Autopilot fetch --tags
+git -C PX4-Autopilot checkout "$PX4_VERSION"
+git -C PX4-Autopilot submodule update --init --recursive
 
 #if [[ ! -d qgroundcontrol ]]; then
 #  git clone https://github.com/mavlink/qgroundcontrol.git
