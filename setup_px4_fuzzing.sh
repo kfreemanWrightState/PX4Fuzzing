@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+PX4_VERSION="v1.16.1"
 #############################################
 # PX4 AFL++ Persistent Fuzzing Setup Script
 # Ubuntu 24.04 LTS
@@ -108,7 +108,7 @@ echo "[STEP 3] Cloning repositories"
 
 
 if [[ ! -d PX4-Autopilot ]]; then
-  git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+  git clone --branch "$PX4_VERSION" https://github.com/PX4/PX4-Autopilot.git --recursive
 else
   echo "PX4-Autopilot already exists, skipping clone"
 fi
@@ -164,9 +164,13 @@ echo
 #############################################
 echo "[STEP 6] Fixing PX4 compile flag issue"
 
-grep -Rl 'O0-fprofile-arcs' . --exclude-dir=build \
-  | xargs sed -i 's/O0-fprofile-arcs/O0 -fprofile-arcs/g'
-
+if grep -RIlq --exclude-dir=build 'O0-fprofile-arcs' .; then
+  grep -RIlZ --exclude-dir=build 'O0-fprofile-arcs' . \
+    | xargs -0 -r sed -i 's/O0-fprofile-arcs/O0 -fprofile-arcs/g'
+  echo "Compile flags fixed"
+else
+  echo "No compile flag fixes needed"
+fi
 echo "Compile flags fixed"
 echo
 
