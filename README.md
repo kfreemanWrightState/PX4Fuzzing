@@ -105,7 +105,7 @@ Clone PX4:
 > Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
 
 ```bash
-git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+git clone --branch v1.16.1 https://github.com/PX4/PX4-Autopilot.git --recursive
 ```
 
 Clone QGroundControl source (optional):
