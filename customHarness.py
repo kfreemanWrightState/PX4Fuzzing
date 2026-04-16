@@ -39,6 +39,8 @@ from pymavlink import mavutil
 from pymavlink.dialects.v20 import common as mavlink2  # for explicit enums
 #from cov_reporter import start_coverage_thread_from_ini
 
+REPO_ROOT = Path(__file__).resolve().parent
+
 # --------------------- Configuration (env overrides) ---------------------
 MAVLINK_HOST = os.getenv("MAVLINK_HOST", "127.0.0.1")   # PX4 IP for UDP
 MAVLINK_PORT = int(os.getenv("MAVLINK_PORT", "14540")) # PX4 RX port (we send to this)
@@ -71,6 +73,16 @@ MIN_INPUT = int(os.getenv("MIN_INPUT", "1"))
 PX4_STARTUP_WAIT_S = float(os.getenv("PX4_STARTUP_WAIT_S", "30"))
 LOGFILE          = os.getenv("HARNESS_LOG", "findings/combined_fuzz.log")
 RESTART_LOCK     = os.getenv("PX4_RESTART_LOCK", "findings/px4_restart.lock")
+PX4_TERMINAL_LOG = os.getenv(
+    "PX4_TERMINAL_LOG",
+    str(REPO_ROOT / "findings" / "px4_terminal.log"),
+)
+POTENTIAL_CRASH_REPORT_DIR = os.getenv(
+    "POTENTIAL_CRASH_REPORT_DIR",
+    str(REPO_ROOT / "findings" / "potential_crash_reports"),
+)
+PX4_TERMINAL_TAIL_LINES = int(os.getenv("PX4_TERMINAL_TAIL_LINES", "250"))
+ASAN_EXCERPT_LINES = int(os.getenv("ASAN_EXCERPT_LINES", "120"))
 
 GCS_SYSTEM_ID    = int(os.getenv("GCS_SYSTEM_ID", "250"))
 GCS_COMPONENT_ID = int(os.getenv(
@@ -84,7 +96,7 @@ FORKSERVER_ITERATIONS = int(os.getenv("FORKSERVER_ITERATIONS", "0"))
 HARNESS_SEED = os.getenv("HARNESS_SEED")
 MISSION_MIN_LEN = int(os.getenv("MISSION_MIN_LEN", "10"))
 MISSION_START_MAX_LEN = int(os.getenv("MISSION_START_MAX_LEN", "30"))
-MISSION_MAX_LEN_CAP = int(os.getenv("MISSION_MAX_LEN_CAP", "50"))
+MISSION_MAX_LEN_CAP = int(os.getenv("MISSION_MAX_LEN_CAP", "10000"))
 MISSION_LEN_GROWTH_STEP = int(os.getenv("MISSION_LEN_GROWTH_STEP", "5"))
 MISSION_LEN_GROWTH_EVERY = int(os.getenv("MISSION_LEN_GROWTH_EVERY", "250"))
 REPORT_SNAPSHOT_INTERVAL_S = int(os.getenv("REPORT_SNAPSHOT_INTERVAL_S", str(4 * 60 * 60)))
@@ -202,21 +214,130 @@ def mission_length_window(iteration: int):
     return min_len, current_max
 
 
-def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
+def _mission_target_len(buf, want_len=10, iteration=0, minimum=None):
+    min_len, max_len = mission_length_window(iteration)
+    if minimum is not None:
+        min_len = max(min_len, minimum)
+        max_len = max(max_len, min_len)
+
+    if len(buf) >= 1:
+        span = max_len - min_len + 1
+        return min_len + (_first_byte(buf) % span)
+
+    return min(max_len, max(min_len, want_len))
+
+
+def _mutate_global_position(base_lat, base_lon, chunk, iteration, fallback_alt=20.0):
+    dlat = _s16(_pick_from(chunk, 0, 2, 0))
+    dlon = _s16(_pick_from(chunk, 2, 2, 0))
+    step_scale = 10 + (iteration // max(1, MISSION_LEN_GROWTH_EVERY))
+    lat = int(base_lat + dlat * step_scale)
+    lon = int(base_lon + dlon * step_scale)
+    alt = max(5.0, min(120.0, fallback_alt))
+    return lat, lon, alt
+
+
+def build_valid_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
+    """
+    Build a conservative mission that should usually upload successfully.
+    """
+    target_len = _mission_target_len(buf, want_len=want_len, iteration=iteration, minimum=4)
+    home = dict(base_items[0])
+    base_lat = home["x"]
+    base_lon = home["y"]
+    items = []
+
+    for i in range(target_len):
+        chunk = buf[1 + i * 20:1 + (i + 1) * 20]
+        if i == 0:
+            it = dict(home)
+            it.update(
+                seq=0,
+                current=1,
+                autocontinue=1,
+                frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                command=mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                param1=0.0,
+                param2=0.0,
+                param3=0.0,
+                param4=0.0,
+                z=20.0 + ((chunk[0] if chunk else 0) % 25),
+            )
+            items.append(it)
+            continue
+
+        if i == target_len - 1:
+            land_chunk = chunk or b"\x00"
+            final_cmd = (
+                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
+                if (land_chunk[0] & 0x1)
+                else mavutil.mavlink.MAV_CMD_NAV_LAND
+            )
+            it = dict(base_items[-1])
+            it.update(
+                seq=i,
+                current=0,
+                autocontinue=1,
+                frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                command=final_cmd,
+                param1=0.0,
+                param2=0.0,
+                param3=0.0,
+                param4=0.0,
+                x=base_lat,
+                y=base_lon,
+                z=0.0 if final_cmd == mavutil.mavlink.MAV_CMD_NAV_LAND else 20.0,
+            )
+            items.append(it)
+            continue
+
+        lat, lon, alt = _mutate_global_position(base_lat, base_lon, chunk, iteration, fallback_alt=20.0 + i)
+        pattern = (chunk[0] if chunk else 0) % 5
+        command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        if pattern == 3:
+            command = mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME
+        elif pattern == 4:
+            command = mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS
+
+        it = dict(base_items[min(1, len(base_items) - 1)])
+        it.update(
+            seq=i,
+            current=0,
+            autocontinue=1,
+            frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            command=command,
+            param1=0.0,
+            param2=2.0,
+            param3=0.0,
+            param4=0.0,
+            x=lat,
+            y=lon,
+            z=alt,
+        )
+
+        if command == mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME:
+            it["param1"] = 5.0 + ((chunk[6] if len(chunk) > 6 else i) % 45)
+            it["param3"] = 8.0 + ((chunk[7] if len(chunk) > 7 else i) % 20)
+        elif command == mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS:
+            it["param1"] = 1.0 + ((chunk[6] if len(chunk) > 6 else i) % 4)
+            it["param3"] = 8.0 + ((chunk[7] if len(chunk) > 7 else i) % 20)
+        else:
+            it["param1"] = float((chunk[6] if len(chunk) > 6 else 0) % 4)
+            it["param2"] = 2.0 + float((chunk[7] if len(chunk) > 7 else i) % 8)
+
+        items.append(it)
+
+    return items
+
+
+def build_invalid_prone_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
     """
     Semantic mutation: keeps mission structure valid but changes fields based on buf.
     Returns a new list of items (MISSION_ITEM_INT compatible).
     """
     items = [dict(x) for x in base_items]
 
-    min_len, max_len = mission_length_window(iteration)
-
-    # Grow the allowable mission length as the fuzz run progresses.
-    if len(buf) >= 1:
-        span = max_len - min_len + 1
-        L = min_len + (_first_byte(buf) % span)
-    else:
-        L = min(max_len, max(min_len, want_len))
+    L = _mission_target_len(buf, want_len=want_len, iteration=iteration)
 
     # Expand/shrink by repeating a stable waypoint-like item so the structure
     # stays mostly valid as the mission grows.
@@ -324,6 +445,109 @@ def mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
     return items
 
 
+def build_recursive_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
+    """
+    Build a structurally valid mission with DO_JUMP loops that are effectively non-terminating.
+    """
+    target_len = _mission_target_len(buf, want_len=want_len, iteration=iteration, minimum=6)
+    home = dict(base_items[0])
+    base_lat = home["x"]
+    base_lon = home["y"]
+    items = []
+
+    items.append(dict(
+        seq=0,
+        frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        command=mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        current=1,
+        autocontinue=1,
+        param1=0.0, param2=0.0, param3=0.0, param4=0.0,
+        x=base_lat, y=base_lon, z=20.0,
+    ))
+
+    loop_anchor_a = max(1, (target_len // 2) - 1)
+    loop_anchor_b = loop_anchor_a + 1
+    jump_repeat_count = 65535.0
+
+    for i in range(1, target_len):
+        if i == target_len - 1:
+            items.append(dict(
+                seq=i,
+                frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                command=mavutil.mavlink.MAV_CMD_NAV_LAND,
+                current=0,
+                autocontinue=1,
+                param1=0.0, param2=0.0, param3=0.0, param4=0.0,
+                x=base_lat, y=base_lon, z=0.0,
+            ))
+            continue
+
+        if i == loop_anchor_a:
+            items.append(dict(
+                seq=i,
+                frame=mavutil.mavlink.MAV_FRAME_MISSION,
+                command=mavutil.mavlink.MAV_CMD_DO_JUMP,
+                current=0,
+                autocontinue=1,
+                param1=float(loop_anchor_b),
+                param2=jump_repeat_count,
+                param3=0.0,
+                param4=0.0,
+                x=0, y=0, z=0.0,
+            ))
+            continue
+
+        if i == loop_anchor_b:
+            items.append(dict(
+                seq=i,
+                frame=mavutil.mavlink.MAV_FRAME_MISSION,
+                command=mavutil.mavlink.MAV_CMD_DO_JUMP,
+                current=0,
+                autocontinue=1,
+                param1=float(loop_anchor_a),
+                param2=jump_repeat_count,
+                param3=0.0,
+                param4=0.0,
+                x=0, y=0, z=0.0,
+            ))
+            continue
+
+        chunk = buf[1 + i * 20:1 + (i + 1) * 20]
+        lat, lon, alt = _mutate_global_position(base_lat, base_lon, chunk, iteration, fallback_alt=18.0 + i)
+        items.append(dict(
+            seq=i,
+            frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            current=0,
+            autocontinue=1,
+            param1=float((chunk[6] if len(chunk) > 6 else 0) % 3),
+            param2=2.0 + float((chunk[7] if len(chunk) > 7 else i) % 6),
+            param3=0.0,
+            param4=0.0,
+            x=lat,
+            y=lon,
+            z=alt,
+        ))
+
+    return items
+
+
+def mission_strategy_for_iteration(iteration: int):
+    strategies = ("valid", "invalid_prone", "recursive")
+    return strategies[(max(1, iteration) - 1) % len(strategies)]
+
+
+def build_mission_for_iteration(buf, base_items, want_len=10, iteration=0):
+    strategy = mission_strategy_for_iteration(iteration)
+    builders = {
+        "valid": build_valid_mission_from_bytes,
+        "invalid_prone": build_invalid_prone_mission_from_bytes,
+        "recursive": build_recursive_mission_from_bytes,
+    }
+    items = builders[strategy](buf, base_items, want_len=want_len, iteration=iteration)
+    return strategy, items
+
+
 def _json_safe_value(value):
     if isinstance(value, float):
         if math.isnan(value):
@@ -338,6 +562,37 @@ def _serialize_mission_items(items):
     for item in items:
         serialized.append({key: _json_safe_value(value) for key, value in item.items()})
     return serialized
+
+
+def _read_tail_lines(path, max_lines):
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    if max_lines <= 0:
+        return []
+    return lines[-max_lines:]
+
+
+def _extract_asan_excerpt(lines):
+    if not lines:
+        return []
+
+    markers = (
+        "ERROR: AddressSanitizer",
+        "SUMMARY: AddressSanitizer",
+        "AddressSanitizer:",
+    )
+    start_idx = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if any(marker in lines[idx] for marker in markers):
+            start_idx = idx
+    if start_idx is None:
+        return []
+
+    excerpt_start = max(0, start_idx - 5)
+    excerpt_end = min(len(lines), excerpt_start + max(1, ASAN_EXCERPT_LINES))
+    return lines[excerpt_start:excerpt_end]
 
 
 def format_mission_for_text(items, meta=None):
@@ -384,6 +639,7 @@ def record_recent_mission(buf, items, meta):
         "timestamp": time.time(),
         "sha1": hashlib.sha1(buf).hexdigest(),
         "input_len": len(buf),
+        "input_hex": buf.hex(),
         "meta": dict(meta or {}),
         "mission_items": _serialize_mission_items(items),
     })
@@ -407,6 +663,82 @@ def dump_recent_history(reason, trigger_meta=None, out_dir="/tmp/mission_fuzz_ca
         return path
     except Exception:
         return None
+
+
+def write_potential_crash_report(reason, current_input=None, mission_items=None, meta=None):
+    os.makedirs(POTENTIAL_CRASH_REPORT_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    sha1 = hashlib.sha1(current_input or b"").hexdigest() if current_input is not None else None
+    terminal_tail = _read_tail_lines(PX4_TERMINAL_LOG, PX4_TERMINAL_TAIL_LINES)
+    asan_excerpt = _extract_asan_excerpt(terminal_tail)
+
+    payload = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+        "current_case_sha1": sha1,
+        "current_case_len": len(current_input or b"") if current_input is not None else None,
+        "current_case_input_hex": (current_input or b"").hex() if current_input is not None else None,
+        "current_case_meta": meta or {},
+        "current_case_mission_items": _serialize_mission_items(mission_items or []),
+        "recent_mission_count": len(recent_missions),
+        "recent_missions": list(recent_missions),
+        "px4_pids_snapshot": read_px4_pids(),
+        "harness_log": LOGFILE,
+        "px4_terminal_log": PX4_TERMINAL_LOG,
+        "terminal_tail": terminal_tail,
+        "asan_excerpt": asan_excerpt,
+    }
+
+    base = f"{stamp}_{reason}"
+    json_path = os.path.join(POTENTIAL_CRASH_REPORT_DIR, f"{base}.json")
+    txt_path = os.path.join(POTENTIAL_CRASH_REPORT_DIR, f"{base}.txt")
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        json_path = None
+
+    summary_lines = [
+        f"created_at={payload['created_at']}",
+        f"reason={reason}",
+        f"current_case_sha1={sha1}",
+        f"current_case_len={payload['current_case_len']}",
+        f"recent_mission_count={payload['recent_mission_count']}",
+        f"px4_terminal_log={PX4_TERMINAL_LOG}",
+        "",
+        "current_case:",
+        format_mission_for_text(payload["current_case_mission_items"], payload["current_case_meta"]),
+        "",
+        "recent_missions:",
+    ]
+    for entry in payload["recent_missions"]:
+        summary_lines.append(
+            format_mission_for_text(entry.get("mission_items", []), entry.get("meta"))
+        )
+        summary_lines.append("")
+
+    if asan_excerpt:
+        summary_lines.append("asan_excerpt:")
+        summary_lines.extend(asan_excerpt)
+        summary_lines.append("")
+
+    if terminal_tail:
+        summary_lines.append("terminal_tail:")
+        summary_lines.extend(terminal_tail)
+        summary_lines.append("")
+
+    try:
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(summary_lines))
+    except Exception:
+        txt_path = None
+
+    log(
+        f"[potential_crash_report] reason={reason} "
+        f"json={json_path or 'write_failed'} txt={txt_path or 'write_failed'}"
+    )
+    return json_path or txt_path
 
 
 def _periodic_snapshot_path(out_dir):
@@ -820,6 +1152,9 @@ def ensure_px4_running():
 def start_px4():
     px4_dir = PX4_DIR
     num_procs = os.getenv("NUM_PROCS", str(os.cpu_count() or 4))
+    px4_terminal_log_path = Path(PX4_TERMINAL_LOG)
+    px4_terminal_log_path.parent.mkdir(parents=True, exist_ok=True)
+    px4_terminal_log_path.touch(exist_ok=True)
 
     '''make_cmd = (
         f'export LD_PRELOAD="$PWD/scripts/libgcov_flush.so${LD_PRELOAD:+:$LD_PRELOAD}"'
@@ -865,9 +1200,6 @@ def start_px4():
         raise
 
     try:
-        # Send gnome-terminal stderr/stdout to a real log file so you can see failures
-        term_log = open("/tmp/px4_gnome_terminal.log", "ab", buffering=0)
-
         # ONE bash -lc layer only; no extra quoting games
         #bash_line = (
         #    'export LD_PRELOAD=$PWD/../scripts/libgcov_flush.so:${LD_PRELOAD}; '
@@ -876,7 +1208,7 @@ def start_px4():
         bash_line = (
         f'cd "{px4_dir}" && '
         #f'LD_PRELOAD="$PWD/../scripts/libgcov_flush.so${{LD_PRELOAD:+:$LD_PRELOAD}}" '
-        f'{make_cmd}; '
+        f'({make_cmd}) 2>&1 | tee -a "{px4_terminal_log_path}"; '
         f'exec bash'
 )
         print("BASH_LINE:", bash_line, flush=True)
@@ -890,7 +1222,7 @@ def start_px4():
 
         log(f"[start_px4] launching: {cmd}")
 
-        subprocess.Popen(cmd, stdout=term_log, stderr=term_log)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     finally:
         # release lock
@@ -1289,9 +1621,10 @@ def wait_alt(min_alt_m=CONFIRM_ALT_M, timeout_s=30):
     return False
 
 # ---------------------- Crash handling & restart ---------------------------
-def handle_px4_failure_and_restart():
+def handle_px4_failure_and_restart(reason="px4_failure", current_input=None, mission_items=None, meta=None):
     global vehicle_ready, parent_tx
-    log("[restart] px4 failure detected; restarting")
+    log(f"[restart] px4 failure detected ({reason}); restarting")
+    write_potential_crash_report(reason, current_input=current_input, mission_items=mission_items, meta=meta)
     try:
         with _parent_tx_lock:
             try:
@@ -1311,7 +1644,7 @@ def handle_px4_failure_and_restart():
         vehicle_ready = False
 
 
-def ensure_channels_ready():
+def ensure_channels_ready(report_reason=None, current_input=None, mission_items=None, meta=None):
     """Keep retrying until both the parent heartbeat and mission channels are live."""
     while True:
         parent_ready = True
@@ -1329,7 +1662,12 @@ def ensure_channels_ready():
 
         log("[ensure_channels_ready] mission channel unavailable; restarting PX4 and retrying")
         close_tx()
-        handle_px4_failure_and_restart()
+        handle_px4_failure_and_restart(
+            reason=report_reason or "channel_unavailable",
+            current_input=current_input,
+            mission_items=mission_items,
+            meta=meta,
+        )
         time.sleep(RECONNECT_RETRY_DELAY_S)
 
 # ---------------------- Python forkserver harness loop ---------------------
@@ -1417,10 +1755,16 @@ def missionLoop():
                     next_send_deadline = max(next_send_deadline, time.monotonic()) + (1.0 / MISSION_RATE_HZ)
 
                 buf = generate_random_case(rng) or b"\x00"
-                items = mutate_mission_from_bytes(buf, base_items, want_len=10, iteration=iteration)
+                mission_kind, items = build_mission_for_iteration(
+                    buf,
+                    base_items,
+                    want_len=10,
+                    iteration=iteration,
+                )
                 min_len, max_len = mission_length_window(iteration)
                 case_meta = {
                     "iteration": iteration,
+                    "mission_kind": mission_kind,
                     "mission_len": len(items),
                     "mission_min_len": min_len,
                     "mission_max_len": max_len,
@@ -1448,7 +1792,12 @@ def missionLoop():
                 dump_recent_history("iteration_exception", trigger_meta={**case_meta, "exception": str(e)})
 
             close_tx()
-            ensure_channels_ready()
+            ensure_channels_ready(
+                report_reason="potential_px4_crash",
+                current_input=buf,
+                mission_items=items,
+                meta=case_meta,
+            )
             next_send_deadline = time.monotonic()
     finally:
         if missions_sent:
