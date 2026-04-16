@@ -158,10 +158,13 @@ echo
 #############################################
 echo "[STEP 6] Fixing PX4 compile flag issue"
 
-grep -Rl 'O0-fprofile-arcs' . --exclude-dir=build \
-  | xargs sed -i 's/O0-fprofile-arcs/O0 -fprofile-arcs/g'
-
-echo "Compile flags fixed"
+if grep -RIlq --exclude-dir=build 'O0-fprofile-arcs' .; then
+  grep -RIlZ --exclude-dir=build 'O0-fprofile-arcs' . \
+    | xargs -0 -r sed -i 's/O0-fprofile-arcs/O0 -fprofile-arcs/g'
+  echo "Compile flags fixed"
+else
+  echo "No compile flag fixes needed"
+fi
 echo
 
 #############################################
