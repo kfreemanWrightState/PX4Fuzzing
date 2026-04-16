@@ -1,71 +1,93 @@
-# PX4 Fuzzing Environment Setup (AFL++ Persistent Mode)
+# PX4 Mission Fuzzing Environment Setup
 
-This README provides a complete guide for installing all required packages, building PX4 SITL with sanitizers, preparing AFL++ seeds, and running persistent-mode fuzzing against PX4 using a MAVLink harness.
+This branch uses `customHarness.py`, a standalone PX4 mission fuzzer for SITL.
+It no longer relies on `python-afl`, `py-afl-fuzz`, stdin-driven testcases, or
+the `make_seeds.py` workflow.
 
----
+Instead, the harness:
+
+- keeps long-lived MAVLink connections open
+- sends GCS heartbeats and offboard setpoints continuously
+- generates mission inputs internally
+- alternates between valid, invalid-prone, and recursive mission types
+- grows mission size over time
+- restarts PX4 and Gazebo when failures are detected
+- writes mission previews, recent mission history, and potential crash reports
 
 ## Requirements
 
-Your environment must meet the following requirements before building PX4 and running the fuzzing harness:
+Your environment should meet the following requirements before building PX4 and
+running the mission fuzzer.
 
-### **Operating System (Host or VM)**
-- **Ubuntu 24.04 LTS** (recommended and tested)
-- Other Linux distros *may* work but are not supported by this guide.
+### Operating System
 
-### **System Resources**
-- At least **4 CPU cores** (8 recommended for faster AFL fuzzing)
-- At least **8 GB RAM** (16+ recommended)
-- At least **20 GB free disk space**
-  - PX4 + Gazebo + logs + AFL findings can grow quickly.
+- Ubuntu 24.04 LTS is the recommended and tested platform
+- Other Linux distributions may work, but are not covered by this guide
 
-### **Internet Access**
-Required for:
-- Installing system packages  
-- Downloading PX4, QGroundControl, Gazebo dependencies  
-- Fetching Python modules and AFL++ updates  
+### System Resources
 
-### **Software Requirements**
-This project requires:
-- **Python 3.10+**
-- **pip** (Python package manager)
-- **clang** and **lld** (for ASan builds)
-- **AFL++** or **python-afl**
-- **Git**
-- **PX4-Autopilot** source code
-- **Gazebo Garden / Gazebo Classic**
-- **QGroundControl (optional)** for manual MAVLink verification
+- At least 4 CPU cores, 8 recommended
+- At least 8 GB RAM, 16+ GB recommended
+- At least 20 GB free disk space
+- More disk space is helpful because PX4 builds, logs, and crash reports can grow quickly
 
-### **Hardware Acceleration (Optional)**
-For improved Gazebo performance:
-- A GPU that supports **OpenGL 3.3+**
-- Proprietary NVIDIA/AMD drivers (optional but helpful)
+### Internet Access
 
-# Setup Instructions
-To setup the fuzzing envrionment either run the setup script below which will run 
-the entire setup process or follow the setup steps one at a time. The setup process 
-may take up to an hour mor more to complete.  
+Internet access is required for:
 
-## Option 1 : Run the setup script
-> **Note:** The setup script downloads multiple repositories and dependencies.  
-> Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
->
-> If the script is **not executed as root**, you will be prompted to enter your **sudo password**
-> during the installation process.
+- installing system packages
+- downloading PX4 and its dependencies
+- installing Python modules
+- downloading QGroundControl if you want the optional ground station
+
+### Software Requirements
+
+This project uses:
+
+- Python 3.10+
+- pip
+- `pymavlink`
+- clang and lld
+- Git
+- PX4-Autopilot source code
+- Gazebo
+- QGroundControl, optional
+
+## Setup Instructions
+
+You can either run the provided setup script or follow the manual steps below.
+The full setup can easily take an hour or more depending on network speed and
+how much of PX4 needs to be built from scratch.
+
+## Option 1: Run the Setup Script
+
+If the script is not run as root, it will ask for sudo once and keep that
+authorization alive while setup is running.
 
 ```bash
 sudo apt update
-sudo apt install git 
+sudo apt install git
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
 cd PX4Fuzzing
+git checkout customFuzzer
 ./setup_px4_fuzzing.sh
 
-AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
-py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
+python3 customHarness.py --initial-startup-wait
 ```
-## Option 2 : Run the setup steps one at a time 
----
 
-## 1. Install All Required Packages
+Useful variations:
+
+```bash
+# short smoke test
+python3 customHarness.py --initial-startup-wait --iterations 100
+
+# reproducible run
+python3 customHarness.py --initial-startup-wait --iterations 1000 --seed 1234
+```
+
+## Option 2: Run the Setup Steps Manually
+
+## 1. Install Required Packages
 
 ```bash
 sudo apt update && sudo apt-get upgrade -y
@@ -79,202 +101,173 @@ sudo apt install -y \
   libc6-dev libstdc++-14-dev \
   libc++-dev libc++abi-dev \
   python3 python3-pip git \
-  valgrind afl++ \
+  valgrind \
   wget unzip tar lcov
 ```
 
-Install python-afl:
+## 2. Install Python Mission Harness Dependencies
+
+`customHarness.py` requires `pymavlink`.
 
 ```bash
-sudo pip3 install --upgrade python-afl --break-system-packages
+sudo pip3 install --upgrade pymavlink --break-system-packages
 ```
 
----
-
-## 2. Clone Required Repositories
+## 3. Clone Required Repositories
 
 Clone this project:
 
 ```bash
 git clone https://github.com/kfreemanWrightState/PX4Fuzzing.git
 cd PX4Fuzzing
+git checkout customFuzzer
 ```
 
 Clone PX4:
-> **Note:** This step downloads multiple repositories and dependencies.  
-> Depending on your internet connection speed, this process may take **up to an hour or more** to complete.
 
 ```bash
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive
 ```
 
-Clone QGroundControl source (optional):
-> **Note:** This is an optional piece of software that can be used to interact with the PX4 Software in the Loop
-> It is not needed or used during the fuzzing process.   
+Optional QGroundControl source:
 
 ```bash
 git clone https://github.com/mavlink/qgroundcontrol.git
 ```
 
-Download the prebuilt QGroundControl AppImage (optional):
-> **Note:** This is an optional piece of software that can be used to interact with the PX4 Software in the Loop
-> It is not needed or used during the fuzzing process.   
+Optional QGroundControl AppImage:
 
 ```bash
 wget https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage
 chmod +x QGroundControl*
 ```
 
----
+## 4. Prepare Runtime Directories
 
-## 3. Prepare AFL++ Directory and Seeds
-
-Create AFL findings directory:
-
-```bash
-mkdir findings
-```
-
-Generate seeds (basic MAVLink templates):
+There is no `make_seeds.py` step on this branch because the harness generates
+its own mission inputs internally.
 
 ```bash
-python3 make_seeds.py
-```
-
-Allow large sanitizer core dumps:
-
-```bash
+mkdir -p findings
 ulimit -c unlimited
 ```
 
----
-
-## 4. Build PX4 With Sanitizers Enabled
-
-Enter PX4:
+## 5. Install PX4 Dependencies
 
 ```bash
 cd PX4-Autopilot/
+./Tools/setup/ubuntu.sh
 ```
 
-Fix a compile flag error in the PX4 Code
+## 6. Fix the PX4 Compile Flag Bug
+
 ```bash
 grep -Rl 'O0-fprofile-arcs' . --exclude-dir=build | xargs sed -i 's/O0-fprofile-arcs/O0 -fprofile-arcs/g'
 ```
 
-Install PX4-required dependencies:
+## 7. Build PX4 SITL With AddressSanitizer
 
 ```bash
-./Tools/setup/ubuntu.sh
-```
-
-Build PX4 SITL with AddressSanitizer (Does Not Start the simulator yet):
-
-```bash
-
-#PX4_CMAKE_BUILD_TYPE=Coverage \
-#CC=clang CXX=clang++ \
-#CMAKE_ARGS="\
-#-DCMAKE_C_FLAGS='-fsanitize=address' \
-#-DCMAKE_CXX_FLAGS='-fsanitize=address' \
-#-DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'" \
-#make px4_sitl -j"$(nproc)"
-
 CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 ```
 
 This builds:
 
-- PX4 SITL  
-- Gazebo simulation plugins  
-- ASan/UBSan-instrumented PX4 binaries  
+- PX4 SITL
+- Gazebo simulation plugins
+- ASan-instrumented PX4 binaries
 
----
+## 8. Optional CPU Performance Mode
 
-## 5. Run AFL++ Persistent Fuzzing
-
+If you are running on bare metal rather than a VM, you can optionally switch
+CPU governors to performance mode before long fuzzing runs.
 
 ```bash
-# If you running the PX4 project on a virtual machine skip this command, however if you are running Ubuntu 
-# on a bare metal computer run the following command.  
-# This command makes sure all the cores of the processor are set to performace mode. These canse be set back to 
-# normal using the ubuntu performace settings
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
 ```
 
-Run the Python harness with AFL++ :
+## 9. Run the Mission Fuzzer
+
+Return to the project root and start the harness:
 
 ```bash
-cd .. 
-
-AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
-py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@
+cd ..
+python3 customHarness.py --initial-startup-wait
 ```
 
-AFL++ will:
+Example bounded run:
 
-- start a forkserver  
-- reuse the same Python process (persistent mode)  
-- inject fuzz inputs into MAVLink messages  
-- restart PX4 after crashes  
-- log crashes into `findings/`  
+```bash
+python3 customHarness.py --initial-startup-wait --iterations 1000 --seed 1234
+```
 
----
-![PX4 Fuzzing Diagram](images/px4diagram.jpg)
+## Current Approach
 
+`customHarness.py` is a mission-specific fuzzer. On this branch, the harness:
 
-**Figure: Overview of the PX4 MAVLink Fuzzing Workflow**
+- starts PX4 automatically through `startPX4.sh` if PX4 is not already running
+- maintains parent and mission MAVLink channels
+- uploads missions using the normal MAVLink mission protocol
+- alternates between:
+  - valid missions
+  - invalid-prone mutated missions
+  - recursive `DO_JUMP` missions
+- increases allowable mission size as the run progresses
+- detects PX4 death or channel failure and restarts PX4 and Gazebo automatically
 
-This diagram illustrates how AFL++ interacts with the PX4 Software-In-The-Loop (SITL) process during fuzzing.  
-The parent harness process maintains the MAVLink connection, sends heartbeats, keeps the drone armed, and runs the AFL++ forkserver.  
-Each AFL++ child process receives fuzzed input through standard input, converts it into a MAVLink message, sends it to the PX4 SITL instance, and checks whether PX4 is still alive.
+This is different from the earlier AFL-based approach:
 
-If a crash is detected (or the PX4 PID becomes a zombie), the child triggers a SIGSEGV on itself so AFL++ records the crash and restarts the entire cycle.  
-If no crash occurs, the child exits normally and AFL++ continues mutating inputs.
+- no external seed corpus is required
+- no `py-afl-fuzz` wrapper is used
+- no stdin testcase handoff is used
+- mission structure is generated and mutated inside the harness itself
 
+## Output Files
+
+During a run, the harness writes useful artifacts under `findings/`.
+
+Important files include:
+
+- `findings/combined_fuzz.log`
+- `findings/first_20_missions.txt`
+- `findings/px4_terminal.log`
+- `findings/potential_crash_reports/`
+
+Potential crash reports include:
+
+- the current mission
+- recent mission history
+- mission metadata
+- PX4 terminal log excerpts
+- ASan excerpts when available
 
 ## Notes and Tips
 
-- Gazebo often lingers after crashes. Remove it with:
-
-```bash
-pkill -f gz
-```
-
-- QGroundControl is optional, but useful for observing PX4 behavior.
-- PX4 sanitizer output appears directly in the PX4 terminal window.
-- Core dumps (if enabled) are stored in the current directory.
-
----
+- QGroundControl is optional and mainly useful for manual observation
+- If Gazebo lingers after a crash, stop it with `pkill -f gz`
+- `customHarness.py --help` shows all runtime options
+- `--seed` makes runs reproducible
+- `--iterations 0` means run forever
 
 ## References
 
-### **PX4 Documentation**
+### PX4 Documentation
+
 - https://docs.px4.io/main/en/
 - https://docs.px4.io/main/en/simulation/
 - https://docs.px4.io/main/en/sim_gazebo_gz/
 - https://docs.px4.io/main/en/getting_started/px4_basic_concepts#ground-control-stations
 
-### **PX4 Fuzz Testing**
-- https://docs.px4.io/main/en/test_and_ci/fuzz_tests#running-fuzz-tests
-- https://github.com/BOB4Drone/Drone_Hacking_Guideline_ENG/tree/main
+### MAVLink Messaging
 
-### **AFL++**
-- https://aflplus.plus/
-- https://github.com/AFLplusplus/AFLplusplus
-
-### **MAVLink Messaging**
-- https://www.youtube.com/watch?v=iZ-usX1VXRI
-- https://www.youtube.com/watch?v=Ha66uKC-od0
 - https://mavlink.io/en/about/overview.html
 
-### **MAVLink Security Research**
+### MAVLink Security Research
+
 - https://arxiv.org/html/2501.18874v2?utm_source=chatgpt.com
 - https://cosicdatabase.esat.kuleuven.be/backend/publications/files/conferencepaper/2667?utm_source=chatgpt.com
 
-### **Other Embedded System Fuzzing Research**
+### Other Embedded System Fuzzing Research
+
 - https://www.ndss-symposium.org/wp-content/uploads/2023/02/ndss2023_f217_paper.pdf
 - https://www.ndss-symposium.org/ndss-paper/pgfuzz-policy-guided-fuzzing-for-robotic-vehicles/
-
----

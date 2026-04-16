@@ -2,12 +2,12 @@
 set -euo pipefail
 
 #############################################
-# PX4 AFL++ Persistent Fuzzing Setup Script
+# PX4 Mission Fuzzing Setup Script
 # Ubuntu 24.04 LTS
 #############################################
 
 echo "=============================================="
-echo " PX4 AFL++ Persistent Fuzzing Environment Setup"
+echo " PX4 Mission Fuzzing Environment Setup"
 echo "=============================================="
 echo
 #############################################
@@ -60,20 +60,20 @@ sudo apt install -y \
   libc6-dev libstdc++-14-dev \
   libc++-dev libc++abi-dev \
   python3 python3-pip git \
-  valgrind afl++ \
+  valgrind \
   wget unzip tar lcov
 
 echo "System packages installed"
 echo
 
 #############################################
-# STEP 2: Install python-afl
+# STEP 2: Install mission harness Python dependency
 #############################################
-echo "[STEP 2] Installing python-afl"
+echo "[STEP 2] Installing pymavlink"
 
-sudo pip3 install --upgrade python-afl --break-system-packages
+sudo pip3 install --upgrade pymavlink --break-system-packages
 
-echo "python-afl installed"
+echo "pymavlink installed"
 echo
 
 #############################################
@@ -130,21 +130,15 @@ echo "Repositories ready"
 echo
 
 #############################################
-# STEP 4: AFL++ Directories and Seeds
+# STEP 4: Runtime directories
 #############################################
-echo "[STEP 4] Preparing AFL++ directories and seeds"
+echo "[STEP 4] Preparing runtime directories"
 
-mkdir -p findings
-
-if [[ -f make_seeds.py ]]; then
-  python3 make_seeds.py
-else
-  echo "WARNING: make_seeds.py not found"
-fi
+mkdir -p findings findings/potential_crash_reports
 
 ulimit -c unlimited
 
-echo "AFL++ directories and seeds prepared"
+echo "Runtime directories prepared"
 echo
 
 #############################################
@@ -195,21 +189,22 @@ fi
 echo
 
 #############################################
-# STEP 9: Run AFL++ Persistent Fuzzing
+# STEP 9: Run mission fuzzing
 #############################################
-echo "[STEP 9] Ready to start AFL++ persistent fuzzing"
+echo "[STEP 9] Ready to start mission fuzzing"
 echo
-echo "Setup complete. Navigate to the directory containing harnessPersistent.py and run the following command manually:"
+echo "Setup complete. From the repository root, run the mission harness manually:"
 echo
-echo "AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 \\"
-echo "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\"
-echo "py-afl-fuzz -t 2000 -i seeds -o findings -- \\"
-echo "python3 harnessPersistent.py @@"
+echo "python3 customHarness.py --initial-startup-wait"
+echo
+echo "Optional examples:"
+echo "python3 customHarness.py --initial-startup-wait --iterations 100"
+echo "python3 customHarness.py --initial-startup-wait --iterations 1000 --seed 1234"
 echo
 
 #############################################
 # DONE
 #############################################
 echo "=============================================="
-echo " PX4 AFL++ Setup Complete"
+echo " PX4 Mission Fuzzing Setup Complete"
 echo "=============================================="
