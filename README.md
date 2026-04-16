@@ -128,7 +128,7 @@ git checkout customFuzzer
 Clone PX4:
 
 ```bash
-git clone --branch v1.16.1 https://github.com/PX4/PX4-Autopilot.git
+git clone --branch v1.16.1 https://github.com/PX4/PX4-Autopilot.git --recursive
 cd PX4-Autopilot
 git submodule update --init --recursive
 cd ..

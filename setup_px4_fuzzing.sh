@@ -110,7 +110,7 @@ echo "[STEP 3] Cloning repositories"
 
 
 if [[ ! -d PX4-Autopilot ]]; then
-  git clone --branch "$PX4_VERSION" https://github.com/PX4/PX4-Autopilot.git
+  git clone --branch "$PX4_VERSION" https://github.com/PX4/PX4-Autopilot.git --recursive
 else
   echo "PX4-Autopilot already exists, reusing repository"
 fi
