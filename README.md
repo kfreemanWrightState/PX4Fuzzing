@@ -9,9 +9,9 @@ This setup pins PX4 to release `v1.16.1`.
 Instead, the harness:
 
 - keeps long-lived MAVLink connections open
-- sends GCS heartbeats and offboard setpoints continuously
+- keeps PX4 in active OFFBOARD flight with heartbeat and waypoint threads
 - generates mission inputs internally
-- alternates between valid, invalid-prone, and recursive mission types
+- alternates between four mission types, including a noisy out-of-order uploader
 - grows mission size over time
 - restarts PX4 and Gazebo when failures are detected
 - writes mission previews, recent mission history, and potential crash reports
@@ -85,6 +85,10 @@ python3 customHarness.py --initial-startup-wait --iterations 100
 
 # reproducible run
 python3 customHarness.py --initial-startup-wait --iterations 1000 --seed 1234
+
+# tighter patrol with fewer injected non-mission messages
+python3 customHarness.py --initial-startup-wait --iterations 1000 \
+  --waypoint-radius-m 2.5 --waypoint-dwell-s 3 --noise-messages-per-request 1
 ```
 
 ## Option 2: Run the Setup Steps Manually
@@ -212,13 +216,20 @@ python3 customHarness.py --initial-startup-wait --iterations 1000 --seed 1234
 
 - starts PX4 automatically through `startPX4.sh` if PX4 is not already running
 - maintains parent and mission MAVLink channels
+- runs three persistent lifeline threads:
+  - a parent GCS heartbeat thread
+  - a mission-channel GCS heartbeat thread
+  - an offboard waypoint/setpoint thread that keeps the vehicle flying
+- warms up the waypoint stream, switches to `OFFBOARD`, arms, and waits for climb before fuzzing
 - uploads missions using the normal MAVLink mission protocol
 - alternates between:
   - valid missions
   - invalid-prone mutated missions
   - recursive `DO_JUMP` missions
+  - long multipart missions whose upload path injects valid non-mission MAVLink traffic and intentionally sends mission items out of order before retrying the requested item
 - increases allowable mission size as the run progresses
 - detects PX4 death or channel failure and restarts PX4 and Gazebo automatically
+- re-establishes OFFBOARD flight after each restart before sending the next mission
 
 This is different from the earlier AFL-based approach:
 
@@ -226,6 +237,30 @@ This is different from the earlier AFL-based approach:
 - no `py-afl-fuzz` wrapper is used
 - no stdin testcase handoff is used
 - mission structure is generated and mutated inside the harness itself
+
+## Active Flight During Uploads
+
+Mission uploads now happen while the simulated vehicle is already flying. The
+harness continuously sends:
+
+- GCS heartbeats on both the parent and mission channels
+- offboard position targets that walk a small waypoint patrol around the target point
+- the four mission strategies in sequence while those lifelines remain active
+
+This makes it easier to observe whether unrelated but valid MAVLink traffic can
+disturb the mission upload state machine while PX4 is busy controlling a live
+vehicle.
+
+## Useful Runtime Knobs
+
+`customHarness.py --help` shows all runtime options. The most relevant knobs
+for the new behavior are:
+
+- `--noise-messages-per-request`
+- `--waypoint-radius-m`
+- `--waypoint-dwell-s`
+- `--heartbeat-ms`
+- `--setpoint-hz`
 
 ## Output Files
 

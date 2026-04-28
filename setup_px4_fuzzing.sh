@@ -111,13 +111,13 @@ echo "[STEP 3] Cloning repositories"
 
 if [[ ! -d PX4-Autopilot ]]; then
   git clone --branch "$PX4_VERSION" https://github.com/PX4/PX4-Autopilot.git --recursive
+  git -C PX4-Autopilot fetch --tags
+  git -C PX4-Autopilot checkout "$PX4_VERSION"
+  git -C PX4-Autopilot submodule update --init --recursive
 else
   echo "PX4-Autopilot already exists, reusing repository"
 fi
 
-git -C PX4-Autopilot fetch --tags
-git -C PX4-Autopilot checkout "$PX4_VERSION"
-git -C PX4-Autopilot submodule update --init --recursive
 
 #if [[ ! -d qgroundcontrol ]]; then
 #  git clone https://github.com/mavlink/qgroundcontrol.git
@@ -178,6 +178,8 @@ echo
 #############################################
 echo "[STEP 7] Building PX4 SITL with AddressSanitizer"
 
+make clean 
+rm -rf build
 CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 
 echo "PX4 SITL build complete"

@@ -5,7 +5,7 @@ combined_fuzz_lifeline.py
 Single-script workflow:
  - optionally start PX4 (via START_CMD),
  - create a persistent MAVLink 'udpout:' connection so we don't reconnect each testcase,
- - run lifeline threads: GCS heartbeat (2 Hz) and Offboard position setpoints (20 Hz),
+ - run lifeline threads: parent + mission GCS heartbeats and offboard waypoint setpoints,
  - run a Python-managed fork loop: generate testcase bytes, send to PX4 quickly,
  - monitor PX4 PIDs (zombie or missing) and restart PX4 if needed (uses flock to avoid races).
 
@@ -109,6 +109,9 @@ RECONNECT_RETRY_DELAY_S = float(os.getenv("RECONNECT_RETRY_DELAY_S", "2.0"))
 RECENT_HISTORY_LIMIT = int(os.getenv("RECENT_HISTORY_LIMIT", "20"))
 FIRST_MISSION_DUMP_LIMIT = int(os.getenv("FIRST_MISSION_DUMP_LIMIT", "20"))
 FIRST_MISSION_DUMP_FILE = os.getenv("FIRST_MISSION_DUMP_FILE", "findings/first_20_missions.txt")
+NOISE_MESSAGES_PER_REQUEST = int(os.getenv("NOISE_MESSAGES_PER_REQUEST", "2"))
+WAYPOINT_RADIUS_M = float(os.getenv("WAYPOINT_RADIUS_M", "4.0"))
+WAYPOINT_DWELL_S = float(os.getenv("WAYPOINT_DWELL_S", "5.0"))
 INITIAL_STARTUP_WAIT = False
 
 vehicle_ready = False
@@ -201,6 +204,25 @@ def _pick_from(buf, off, n, default=0):
 
 def _first_byte(buf, default=0):
     return buf[0] if buf else default
+
+
+def _seeded_case_rng(buf, salt):
+    digest = hashlib.sha1(salt + buf).digest()
+    return random.Random(int.from_bytes(digest[:8], "little"))
+
+
+def build_out_of_order_plan(buf, count):
+    if count <= 1:
+        return [0] if count == 1 else []
+
+    plan = list(range(count))
+    rng = _seeded_case_rng(buf, b"mission_out_of_order_plan")
+    for _ in range(16):
+        rng.shuffle(plan)
+        if all(idx != seq for idx, seq in enumerate(plan)):
+            return plan
+
+    return plan[1:] + plan[:1]
 
 
 def mission_length_window(iteration: int):
@@ -532,8 +554,83 @@ def build_recursive_mission_from_bytes(buf, base_items, want_len=10, iteration=0
     return items
 
 
+def build_multipart_noisy_mission_from_bytes(buf, base_items, want_len=10, iteration=0):
+    """
+    Build a longer mission with distinct phases so upload order perturbations happen
+    against a non-trivial mission graph while the vehicle is already flying in OFFBOARD.
+    """
+    target_len = _mission_target_len(buf, want_len=max(want_len, 16), iteration=iteration, minimum=12)
+    home = dict(base_items[0])
+    base_lat = home["x"]
+    base_lon = home["y"]
+    items = []
+
+    def waypoint_item(seq, lat, lon, alt, command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT):
+        return dict(
+            seq=seq,
+            frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            command=command,
+            current=1 if seq == 0 else 0,
+            autocontinue=1,
+            param1=0.0,
+            param2=2.0,
+            param3=0.0,
+            param4=0.0,
+            x=lat,
+            y=lon,
+            z=alt,
+        )
+
+    items.append(waypoint_item(0, base_lat, base_lon, 22.0, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF))
+
+    if target_len == 1:
+        return items
+
+    segment_den = max(1, target_len - 2)
+    orbit_scale = 12 + (iteration // max(1, MISSION_LEN_GROWTH_EVERY))
+
+    for seq in range(1, target_len - 1):
+        chunk = buf[1 + seq * 20:1 + (seq + 1) * 20]
+        progress = (seq - 1) / segment_den
+        ring = 1 + (seq % 3)
+        dlat = (_s16(_pick_from(chunk, 0, 2, 0)) // 8) + int(math.cos(seq) * orbit_scale * ring)
+        dlon = (_s16(_pick_from(chunk, 2, 2, 0)) // 8) + int(math.sin(seq) * orbit_scale * ring)
+        lat = int(base_lat + dlat * 10)
+        lon = int(base_lon + dlon * 10)
+        alt = 20.0 + float((chunk[4] if len(chunk) > 4 else seq) % 35)
+        item = waypoint_item(seq, lat, lon, alt)
+
+        if progress < 0.25:
+            item["param1"] = float((chunk[5] if len(chunk) > 5 else seq) % 4)
+            item["param2"] = 2.0 + float((chunk[6] if len(chunk) > 6 else seq) % 8)
+        elif progress < 0.50:
+            item["command"] = mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME
+            item["param1"] = 10.0 + float((chunk[7] if len(chunk) > 7 else seq) % 40)
+            item["param3"] = 8.0 + float((chunk[8] if len(chunk) > 8 else seq) % 20)
+        elif progress < 0.75:
+            item["command"] = mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS
+            item["param1"] = 1.0 + float((chunk[9] if len(chunk) > 9 else seq) % 4)
+            item["param3"] = 8.0 + float((chunk[10] if len(chunk) > 10 else seq) % 20)
+        else:
+            item["x"] = int(base_lat - dlat * 6)
+            item["y"] = int(base_lon - dlon * 6)
+            item["param1"] = float((chunk[11] if len(chunk) > 11 else seq) % 3)
+            item["param2"] = 1.0 + float((chunk[12] if len(chunk) > 12 else seq) % 5)
+
+        items.append(item)
+
+    final_chunk = buf[1 + (target_len - 1) * 20:1 + target_len * 20] or b"\x00"
+    final_cmd = (
+        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
+        if (final_chunk[0] & 0x1)
+        else mavutil.mavlink.MAV_CMD_NAV_LAND
+    )
+    items.append(waypoint_item(target_len - 1, base_lat, base_lon, 0.0 if final_cmd == mavutil.mavlink.MAV_CMD_NAV_LAND else 20.0, final_cmd))
+    return items
+
+
 def mission_strategy_for_iteration(iteration: int):
-    strategies = ("valid", "invalid_prone", "recursive")
+    strategies = ("valid", "invalid_prone", "recursive", "multipart_noisy")
     return strategies[(max(1, iteration) - 1) % len(strategies)]
 
 
@@ -543,6 +640,7 @@ def build_mission_for_iteration(buf, base_items, want_len=10, iteration=0):
         "valid": build_valid_mission_from_bytes,
         "invalid_prone": build_invalid_prone_mission_from_bytes,
         "recursive": build_recursive_mission_from_bytes,
+        "multipart_noisy": build_multipart_noisy_mission_from_bytes,
     }
     items = builders[strategy](buf, base_items, want_len=want_len, iteration=iteration)
     return strategy, items
@@ -826,7 +924,6 @@ def set_mavlink2(m, enable=True):
     m.force_mavlink1 = not enable
 
 def clear_mission(m, mission_type=mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
-    msg = None
     try:
         with _tx_lock:
             m.mav.mission_clear_all_send(
@@ -834,15 +931,18 @@ def clear_mission(m, mission_type=mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
                 m.target_component,
                 mission_type
             )
-            # PX4 will usually ACK; we wait a bit for robustness
-            msg = m.recv_match(type="MISSION_ACK", blocking=True, timeout=CLEAR_MISSION_TIMEOUT_S)
     except Exception:
         pass
-    if msg:
-        pass
-        #print("CLEAR_ALL ACK:", msg.type)
-    else:
-        print("No MISSION_ACK to CLEAR_ALL (continuing)")
+        return False
+
+    deadline = time.time() + CLEAR_MISSION_TIMEOUT_S
+    while time.time() < deadline:
+        msg = _recv_match_short(m, timeout_s=min(0.2, max(0.01, deadline - time.time())))
+        if msg and msg.get_type() == "MISSION_ACK":
+            return True
+
+    print("No MISSION_ACK to CLEAR_ALL (continuing)")
+    return False
 
 def build_mission_items():
     # A simple global mission near "home".
@@ -968,6 +1068,198 @@ def upload_mission(m, items, mission_type=mavutil.mavlink.MAV_MISSION_TYPE_MISSI
             return msg.type
 
 
+def _send_mission_item(m, item, mission_type):
+    with _tx_lock:
+        m.mav.mission_item_int_send(
+            m.target_system,
+            m.target_component,
+            item["seq"],
+            item["frame"],
+            item["command"],
+            item["current"],
+            item["autocontinue"],
+            item["param1"], item["param2"], item["param3"], item["param4"],
+            item["x"], item["y"], item["z"],
+            mission_type
+        )
+
+
+def current_waypoint_target(now=None):
+    now = time.monotonic() if now is None else now
+    dwell_s = max(0.5, WAYPOINT_DWELL_S)
+    radius_m = max(0.5, WAYPOINT_RADIUS_M)
+    targets = [
+        (TARGET_X, TARGET_Y, TARGET_Z),
+        (TARGET_X + radius_m, TARGET_Y, TARGET_Z),
+        (TARGET_X, TARGET_Y + radius_m, TARGET_Z),
+        (TARGET_X - radius_m, TARGET_Y, TARGET_Z),
+        (TARGET_X, TARGET_Y - radius_m, TARGET_Z),
+    ]
+    idx = int(now / dwell_s) % len(targets)
+    return targets[idx], idx
+
+
+def send_random_valid_non_mission_message(m, case_rng):
+    message_type = case_rng.choice((
+        "heartbeat",
+        "ping",
+        "request_message",
+        "request_data_stream",
+        "param_request_read",
+        "position_target",
+        "timesync",
+    ))
+    with _tx_lock:
+        if m is None:
+            return "skipped"
+        if message_type == "heartbeat":
+            m.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0,
+                0,
+                mavutil.mavlink.MAV_STATE_ACTIVE,
+            )
+        elif message_type == "ping":
+            m.mav.ping_send(
+                int(time.time() * 1_000_000),
+                case_rng.randrange(1, 1 << 31),
+                m.target_system or 0,
+                m.target_component or 0,
+            )
+        elif message_type == "request_message":
+            requested_msg = case_rng.choice((
+                mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+                mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION,
+                mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,
+            ))
+            m.mav.command_long_send(
+                m.target_system or 0,
+                m.target_component or 0,
+                mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                0,
+                float(requested_msg), 0, 0, 0, 0, 0, 0,
+            )
+        elif message_type == "request_data_stream":
+            m.mav.request_data_stream_send(
+                m.target_system or 0,
+                m.target_component or 0,
+                mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+                2 + case_rng.randrange(4),
+                1,
+            )
+        elif message_type == "param_request_read":
+            param_name = case_rng.choice(("SYS_AUTOSTART", "MAV_TYPE", "COM_ARM_WO_GPS"))
+            m.mav.param_request_read_send(
+                m.target_system or 0,
+                m.target_component or 0,
+                param_name.encode("ascii"),
+                -1,
+            )
+        elif message_type == "position_target":
+            (target_x, target_y, target_z), _ = current_waypoint_target()
+            mask = (
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+            )
+            m.mav.set_position_target_local_ned_send(
+                int(time.time() * 1000) & 0xFFFFFFFF,
+                m.target_system or 1,
+                m.target_component or 1,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                mask,
+                target_x,
+                target_y,
+                target_z,
+                0, 0, 0,
+                0, 0, 0,
+                0, 0,
+            )
+        elif message_type == "timesync":
+            m.mav.timesync_send(0, int(time.time_ns()))
+    return message_type
+
+
+def upload_mission_with_noise_and_out_of_order(
+    m,
+    items,
+    buf,
+    case_meta=None,
+    mission_type=mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+    timeout_s=None,
+):
+    timeout_s = MISSION_UPLOAD_TIMEOUT_S if timeout_s is None else timeout_s
+    count = len(items)
+    out_of_order_plan = build_out_of_order_plan(buf, count)
+    noise_rng = _seeded_case_rng(buf, b"interleaved_non_mission_noise")
+    wrong_send_idx = 0
+    sent = 0
+    noise_events = []
+    wrong_item_pairs = []
+    request_retries = {}
+
+    if case_meta is not None:
+        case_meta["noise_messages_per_request"] = NOISE_MESSAGES_PER_REQUEST
+        case_meta["out_of_order_preview"] = out_of_order_plan[:min(12, len(out_of_order_plan))]
+
+    with _tx_lock:
+        m.mav.mission_count_send(m.target_system, m.target_component, count, mission_type)
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        msg = _recv_match_short(m)
+        if not msg:
+            continue
+
+        t = msg.get_type()
+        if t in ("MISSION_REQUEST_INT", "MISSION_REQUEST"):
+            seq = int(msg.seq)
+            if seq < 0 or seq >= count:
+                raise RuntimeError(f"PX4 requested out-of-range seq={seq} count={count}")
+
+            request_retries[seq] = request_retries.get(seq, 0) + 1
+
+            for _ in range(max(0, NOISE_MESSAGES_PER_REQUEST)):
+                noise_events.append(send_random_valid_non_mission_message(m, noise_rng))
+
+            while wrong_send_idx < len(out_of_order_plan) and out_of_order_plan[wrong_send_idx] == seq:
+                wrong_send_idx += 1
+
+            if wrong_send_idx < len(out_of_order_plan):
+                wrong_seq = out_of_order_plan[wrong_send_idx]
+                _send_mission_item(m, items[wrong_seq], mission_type)
+                wrong_item_pairs.append({"requested_seq": seq, "sent_seq": wrong_seq})
+                wrong_send_idx += 1
+
+            for _ in range(max(0, NOISE_MESSAGES_PER_REQUEST)):
+                noise_events.append(send_random_valid_non_mission_message(m, noise_rng))
+
+            _send_mission_item(m, items[seq], mission_type)
+            sent += 1
+            continue
+
+        if t == "MISSION_ACK":
+            if case_meta is not None:
+                case_meta["noise_messages_sent"] = len(noise_events)
+                case_meta["noise_preview"] = noise_events[:20]
+                case_meta["out_of_order_injections"] = wrong_item_pairs[:20]
+                case_meta["request_retry_counts"] = request_retries
+            return int(msg.type)
+
+    if case_meta is not None:
+        case_meta["noise_messages_sent"] = len(noise_events)
+        case_meta["noise_preview"] = noise_events[:20]
+        case_meta["out_of_order_injections"] = wrong_item_pairs[:20]
+        case_meta["request_retry_counts"] = request_retries
+    raise RuntimeError(f"Timed out waiting for MISSION_ACK (sent={sent}/{count})")
+
+
 # -------------------------------------------------------------------------
 
 # simple logging helper
@@ -1048,6 +1340,24 @@ def build_arg_parser():
     parser.add_argument("--first-mission-dump-limit", type=int, default=FIRST_MISSION_DUMP_LIMIT)
     parser.add_argument("--first-mission-dump-file", default=FIRST_MISSION_DUMP_FILE)
     parser.add_argument(
+        "--noise-messages-per-request",
+        type=int,
+        default=NOISE_MESSAGES_PER_REQUEST,
+        help="Number of valid non-mission MAVLink messages to inject before and after each requested mission item in the multipart_noisy strategy.",
+    )
+    parser.add_argument(
+        "--waypoint-radius-m",
+        type=float,
+        default=WAYPOINT_RADIUS_M,
+        help="Radius of the offboard waypoint patrol used to keep the drone flying during uploads.",
+    )
+    parser.add_argument(
+        "--waypoint-dwell-s",
+        type=float,
+        default=WAYPOINT_DWELL_S,
+        help="Seconds to hold each offboard waypoint target before moving to the next one.",
+    )
+    parser.add_argument(
         "--initial-startup-wait",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1067,6 +1377,7 @@ def apply_runtime_config(args):
     global MISSION_UPLOAD_TIMEOUT_S, CLEAR_MISSION_TIMEOUT_S, RECONNECT_RETRY_DELAY_S
     global RECENT_HISTORY_LIMIT, recent_missions
     global FIRST_MISSION_DUMP_LIMIT, FIRST_MISSION_DUMP_FILE, INITIAL_STARTUP_WAIT
+    global NOISE_MESSAGES_PER_REQUEST, WAYPOINT_RADIUS_M, WAYPOINT_DWELL_S
 
     MAVLINK_HOST = args.mavlink_host
     MAVLINK_PORT = args.mavlink_port
@@ -1107,6 +1418,9 @@ def apply_runtime_config(args):
     RECENT_HISTORY_LIMIT = args.recent_history_limit
     FIRST_MISSION_DUMP_LIMIT = args.first_mission_dump_limit
     FIRST_MISSION_DUMP_FILE = args.first_mission_dump_file
+    NOISE_MESSAGES_PER_REQUEST = max(0, args.noise_messages_per_request)
+    WAYPOINT_RADIUS_M = max(0.5, args.waypoint_radius_m)
+    WAYPOINT_DWELL_S = max(0.5, args.waypoint_dwell_s)
     INITIAL_STARTUP_WAIT = args.initial_startup_wait
     recent_missions = deque(maxlen=max(1, RECENT_HISTORY_LIMIT))
 
@@ -1520,7 +1834,7 @@ def parent_gcs_heartbeat_thread(stop_evt):
             pass
         stop_evt.wait(HEARTBEAT_MS / 1000.0)
 
-def setpoint_thread(stop_evt):
+def waypoint_thread(stop_evt):
     mask = (
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE |
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE |
@@ -1531,40 +1845,55 @@ def setpoint_thread(stop_evt):
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE |
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
     )
+    last_idx = None
     while not stop_evt.is_set():
         try:
+            (target_x, target_y, target_z), target_idx = current_waypoint_target()
+            if target_idx != last_idx:
+                log(
+                    "[waypoint_thread] target_idx=%s x=%.2f y=%.2f z=%.2f"
+                    % (target_idx, target_x, target_y, target_z)
+                )
+                last_idx = target_idx
             with _tx_lock:
                 if tx:
                     tx.mav.set_position_target_local_ned_send(
                         int(time.time()*1000) & 0xFFFFFFFF,
                         tx.target_system or 1, tx.target_component or 1,
                         mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-                        mask, TARGET_X, TARGET_Y, TARGET_Z,
+                        mask, target_x, target_y, target_z,
                         0,0,0, 0,0,0, 0, 0
                     )
         except Exception:
             pass
         stop_evt.wait(1.0 / SETPOINT_HZ)
 
+
+def setpoint_thread(stop_evt):
+    waypoint_thread(stop_evt)
+
 # ----------------- Offboard switch/arm helpers (best-effort) ----------------
 
 def prepare_vehicle_offboard():
-    """Warmup + arm + OFFBOARD; set vehicle_ready True on success."""
+    """Warm up the waypoint stream, switch to OFFBOARD, arm, and confirm climb."""
     global vehicle_ready
-    # 2s warm-up (HB + setpoints already running)
+    # 2s warm-up (HB + waypoint setpoints already running)
     t0 = time.time()
     while time.time() - t0 < 2.0:
-        with _tx_lock:
-            if tx: tx.recv_match(blocking=False)
+        if tx is not None:
+            _recv_match_short(tx, timeout_s=0.05)
         time.sleep(0.05)
 
     # (SITL-friendly) relax a few checks if you want:
     # set_param_tx("COM_ARM_WO_GPS", 1.0)
     # set_param_tx("COM_RCL_EXCEPT", 4.0)
 
+    set_mode_offboard_once()
     armed = arm_once(wait_s=10)
     set_mode_offboard_once()
-    vehicle_ready = armed  # mark ready if we at least armed (OFFBOARD may follow)
+    climbed = armed and wait_alt(CONFIRM_ALT_M, timeout_s=30)
+    vehicle_ready = armed and climbed
+    log(f"[prepare_vehicle_offboard] armed={armed} climbed={climbed} vehicle_ready={vehicle_ready}")
     return vehicle_ready
 
 def set_mode_offboard_once():
@@ -1589,14 +1918,13 @@ def arm_once(wait_s=6):
                                          1, 0,0,0,0,0,0)
     except Exception as e:
         log(f"[arm_once] error: {e}")
-    # best-effort wait for heartbeat armed flag (non-blocking)
-    t0 = time.time()
-    while time.time() - t0 < wait_s:
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
         try:
-            with _tx_lock:
-                if tx:
-                    hb = tx.recv_match(type='HEARTBEAT', blocking=True, timeout=MAVLINK_RECV_TIMEOUT_S)
-                    if hb and (getattr(hb, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+            if tx:
+                hb = _recv_match_short(tx, timeout_s=min(0.2, max(0.01, deadline - time.time())))
+                if hb and hb.get_type() == "HEARTBEAT":
+                    if getattr(hb, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
                         log("[arm_once] armed confirmed")
                         return True
         except Exception:
@@ -1605,13 +1933,13 @@ def arm_once(wait_s=6):
     return False
 
 def wait_alt(min_alt_m=CONFIRM_ALT_M, timeout_s=30):
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
         try:
-            with _tx_lock:
-                if tx:
-                    msg = tx.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=MAVLINK_RECV_TIMEOUT_S)
-                    if msg and getattr(msg, "relative_alt", None) is not None:
+            if tx:
+                msg = _recv_match_short(tx, timeout_s=min(0.2, max(0.01, deadline - time.time())))
+                if msg and msg.get_type() == "GLOBAL_POSITION_INT":
+                    if getattr(msg, "relative_alt", None) is not None:
                         if msg.relative_alt/1000.0 >= min_alt_m:
                             log("[wait_alt] altitude confirmed")
                             return True
@@ -1626,6 +1954,7 @@ def handle_px4_failure_and_restart(reason="px4_failure", current_input=None, mis
     log(f"[restart] px4 failure detected ({reason}); restarting")
     write_potential_crash_report(reason, current_input=current_input, mission_items=mission_items, meta=meta)
     try:
+        close_tx()
         with _parent_tx_lock:
             try:
                 if parent_tx:
@@ -1633,12 +1962,11 @@ def handle_px4_failure_and_restart(reason="px4_failure", current_input=None, mis
             except Exception:
                 pass
             parent_tx = None
-            parent_tx = None
         kill_existing_px4()
         kill_gazebo()
         start_px4()
         connect_parent_tx()
-        vehicle_ready = True
+        vehicle_ready = False
     except Exception as e:
         log(f"[restart] error: {e}")
         vehicle_ready = False
@@ -1669,6 +1997,30 @@ def ensure_channels_ready(report_reason=None, current_input=None, mission_items=
             meta=meta,
         )
         time.sleep(RECONNECT_RETRY_DELAY_S)
+
+
+def ensure_vehicle_ready(report_reason=None, current_input=None, mission_items=None, meta=None):
+    global vehicle_ready
+    while not vehicle_ready:
+        ensure_channels_ready(
+            report_reason=report_reason,
+            current_input=current_input,
+            mission_items=mission_items,
+            meta=meta,
+        )
+        if prepare_vehicle_offboard():
+            return True
+
+        log("[ensure_vehicle_ready] vehicle did not reach stable OFFBOARD flight; restarting PX4")
+        vehicle_ready = False
+        handle_px4_failure_and_restart(
+            reason=report_reason or "vehicle_not_ready",
+            current_input=current_input,
+            mission_items=mission_items,
+            meta=meta,
+        )
+        time.sleep(RECONNECT_RETRY_DELAY_S)
+    return True
 
 # ---------------------- Python forkserver harness loop ---------------------
 def make_case_generator():
@@ -1703,7 +2055,10 @@ def run_single_mission_iteration(buf, items, case_meta):
         if (_first_byte(buf) & 0x7) == 0:
             clear_mission(tx)
 
-        res = upload_mission_safe(tx, items)
+        if case_meta.get("mission_kind") == "multipart_noisy":
+            res = upload_mission_with_noise_and_out_of_order(tx, items, buf, case_meta=case_meta)
+        else:
+            res = upload_mission_safe(tx, items)
         save_last_case(buf, why=f"mission_ack_{res}", mission_items=items, meta=case_meta)
 
         if POST_SEND_MS > 0:
@@ -1726,8 +2081,8 @@ def missionLoop():
     global parent_tx
     rng = make_case_generator()
     base_items = build_mission_items()
-    hb_stop = threading.Event()
-    hb_t = None
+    lifeline_stop = threading.Event()
+    lifeline_threads = []
     missions_sent = 0
     next_send_deadline = time.monotonic()
 
@@ -1736,9 +2091,14 @@ def missionLoop():
     if INITIAL_STARTUP_WAIT:
         wait_for_px4_settle("forkserver bootstrap")
     ensure_channels_ready()
-
-    hb_t = threading.Thread(target=parent_gcs_heartbeat_thread, args=(hb_stop,), daemon=True)
-    hb_t.start()
+    lifeline_threads = [
+        threading.Thread(target=parent_gcs_heartbeat_thread, args=(lifeline_stop,), daemon=True),
+        threading.Thread(target=gcs_heartbeat_thread, args=(lifeline_stop,), daemon=True),
+        threading.Thread(target=waypoint_thread, args=(lifeline_stop,), daemon=True),
+    ]
+    for thread in lifeline_threads:
+        thread.start()
+    ensure_vehicle_ready(report_reason="vehicle_not_ready")
 
     iteration = 0
     try:
@@ -1755,6 +2115,8 @@ def missionLoop():
                     next_send_deadline = max(next_send_deadline, time.monotonic()) + (1.0 / MISSION_RATE_HZ)
 
                 buf = generate_random_case(rng) or b"\x00"
+                if not vehicle_ready:
+                    ensure_vehicle_ready(report_reason="vehicle_not_ready", current_input=buf, meta=case_meta)
                 mission_kind, items = build_mission_for_iteration(
                     buf,
                     base_items,
@@ -1768,7 +2130,12 @@ def missionLoop():
                     "mission_len": len(items),
                     "mission_min_len": min_len,
                     "mission_max_len": max_len,
+                    "flight_mode": "OFFBOARD",
+                    "waypoint_thread_active": True,
                 }
+                if mission_kind == "multipart_noisy":
+                    case_meta["noise_messages_per_request"] = NOISE_MESSAGES_PER_REQUEST
+                    case_meta["out_of_order_preview"] = build_out_of_order_plan(buf, len(items))[:min(12, len(items))]
                 record_recent_mission(buf, items, case_meta)
                 maybe_dump_mission_preview(buf, items, case_meta)
                 exit_code = run_single_mission_iteration(buf, items, case_meta)
@@ -1798,13 +2165,19 @@ def missionLoop():
                 mission_items=items,
                 meta=case_meta,
             )
+            ensure_vehicle_ready(
+                report_reason="vehicle_not_ready",
+                current_input=buf,
+                mission_items=items,
+                meta=case_meta,
+            )
             next_send_deadline = time.monotonic()
     finally:
         if missions_sent:
             print()
-        hb_stop.set()
-        if hb_t:
-            hb_t.join(timeout=1.0)
+        lifeline_stop.set()
+        for thread in lifeline_threads:
+            thread.join(timeout=1.0)
         close_tx()
         with _parent_tx_lock:
             try:
