@@ -178,7 +178,8 @@ echo
 # STEP 7: Build PX4 SITL with ASan
 #############################################
 echo "[STEP 7] Building PX4 SITL with AddressSanitizer"
-
+make clean
+rm -rf build
 CC=clang CXX=clang++ PX4_ASAN=1 make px4_sitl -j"$(nproc)"
 
 echo "PX4 SITL build complete"
@@ -201,16 +202,16 @@ echo
 #############################################
 # STEP 9: Run AFL++ Persistent Fuzzing
 #############################################
+
+cd ..
+
+rm -rf findings/default
 echo "[STEP 9] Ready to start AFL++ persistent fuzzing"
 echo
 echo "Setup complete. Navigate to the directory containing harnessPersistent.py and run the following command manually:"
 echo
-echo "AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 \\"
-echo "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\"
-echo "py-afl-fuzz -t 2000 -i seeds -o findings -- \\"
-echo "python3 harnessPersistent.py @@"
-echo
-
+echo "AFL_FORKSRV_INIT_TMOUT=60000 AFL_DEBUG=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 py-afl-fuzz -t 2000 -i seeds -o findings -- python3 harnessPersistent.py @@"
+echo 
 #############################################
 # DONE
 #############################################
