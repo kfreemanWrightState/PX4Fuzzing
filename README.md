@@ -51,6 +51,8 @@ may take up to an hour mor more to complete.
 >
 > If the script is **not executed as root**, you will be prompted to enter your **sudo password**
 > during the installation process.
+>
+> **If you have any trouble running the script or compiling the code, please visit the Releases for this project.**
 
 ```bash
 sudo apt update
