@@ -44,6 +44,7 @@ For improved Gazebo performance:
 To setup the fuzzing envrionment either run the setup script below which will run 
 the entire setup process or follow the setup steps one at a time. The setup process 
 may take up to an hour mor more to complete.  
+**If you have any trouble running the script or compiling the code, please visit the Releases for this project.**
 
 ## Option 1 : Run the setup script
 > **Note:** The setup script downloads multiple repositories and dependencies.  
@@ -52,7 +53,6 @@ may take up to an hour mor more to complete.
 > If the script is **not executed as root**, you will be prompted to enter your **sudo password**
 > during the installation process.
 >
-> **If you have any trouble running the script or compiling the code, please visit the Releases for this project.**
 
 ```bash
 sudo apt update
