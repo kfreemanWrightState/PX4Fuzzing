@@ -60,6 +60,7 @@ This project uses:
 You can either run the provided setup script or follow the manual steps below.
 The full setup can easily take an hour or more depending on network speed and
 how much of PX4 needs to be built from scratch.
+**If you have any trouble running the setup script or compiling the code, please visit the Releases for this project.**
 
 ## Option 1: Run the Setup Script
 
